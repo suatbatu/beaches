@@ -15,8 +15,12 @@
   const MAX_MARKERS = 250;
   const REQUEST_TIMEOUT_MS = 30000;  // per mirror
   const HEDGE_MS = 6000;             // ask the next mirror too if the current one is this slow
+  const RETRY_DELAYS_MS = [3000, 8000];   // extra attempts after every mirror failed
   const STORAGE_KEY = 'beaches:last';
   const MIRROR_KEY = 'beaches:mirror';
+  const CACHE_KEY = 'beaches:cache';
+  const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  const CACHE_MAX = 6;
 
   const els = {
     locateBtn: document.getElementById('locate-btn'),
@@ -252,6 +256,64 @@
     });
   }
 
+  // Keep only what the UI needs so cached answers stay small.
+  const KEEP_TAGS = ['name', 'name:en', 'alt_name', 'surface', 'lifeguard', 'nudism', 'dog', 'wheelchair', 'fee', 'access'];
+  function slim(el) {
+    const out = { type: el.type, id: el.id, tags: {} };
+    if (el.type === 'node') { out.lat = el.lat; out.lon = el.lon; }
+    else if (el.center) out.center = { lat: el.center.lat, lon: el.center.lon };
+    const tags = el.tags || {};
+    for (const k of KEEP_TAGS) if (tags[k] != null) out.tags[k] = tags[k];
+    return out;
+  }
+
+  // Recent answers live in localStorage for a day, so repeat searches are instant and
+  // a busy Overpass server does not take the app down with it.
+  function cacheKey(center, radiusKm) { return center.lat.toFixed(3) + ',' + center.lon.toFixed(3) + ',' + radiusKm; }
+  function readCache() {
+    try { const raw = localStorage.getItem(CACHE_KEY); const arr = raw ? JSON.parse(raw) : []; return Array.isArray(arr) ? arr : []; }
+    catch (e) { return []; }
+  }
+  function cacheGet(center, radiusKm) {
+    const key = cacheKey(center, radiusKm);
+    const now = Date.now();
+    const hit = readCache().find((e) => e && e.key === key && Array.isArray(e.elements) && now - e.at < CACHE_TTL_MS);
+    return hit ? hit.elements : null;
+  }
+  function cachePut(center, radiusKm, elements) {
+    const key = cacheKey(center, radiusKm);
+    const now = Date.now();
+    const entries = readCache().filter((e) => e && e.key !== key && now - e.at < CACHE_TTL_MS);
+    entries.unshift({ key, at: now, elements });
+    for (let n = Math.min(entries.length, CACHE_MAX); n > 0; n--) {
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(entries.slice(0, n))); return; }
+      catch (e) { /* over quota: keep fewer entries */ }
+    }
+  }
+
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      const onAbort = () => { clearTimeout(t); reject(signal.reason || new DOMException('Aborted', 'AbortError')); };
+      const t = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+      if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  async function fetchWithRetries(center, radiusKm, signal) {
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await fetchBeaches(center, radiusKm, signal);
+      } catch (err) {
+        if (signal.aborted || attempt >= RETRY_DELAYS_MS.length) throw err;
+        const delay = RETRY_DELAYS_MS[attempt++];
+        console.warn('Every Overpass mirror failed; retrying in ' + delay + ' ms');
+        setStatus('Beach servers are busy. Retrying\u2026', { kind: 'busy' });
+        await sleep(delay, signal);
+      }
+    }
+  }
+
   const SURFACE_LABELS = {
     sand: 'Sand', fine_sand: 'Fine sand', pebbles: 'Pebbles', pebblestone: 'Pebbles', gravel: 'Gravel',
     shingle: 'Shingle', rock: 'Rock', rocky: 'Rock', stone: 'Stone', shell: 'Shells', mud: 'Mud', grass: 'Grass',
@@ -313,8 +375,15 @@
       if (reusable) {
         elements = raw.elements;
       } else {
-        elements = await fetchBeaches(center, radiusKm, ctrl.signal);
-        if (seq !== state.searchSeq) return;
+        const cached = cacheGet(center, radiusKm);
+        if (cached) {
+          elements = cached;
+        } else {
+          const fresh = await fetchWithRetries(center, radiusKm, ctrl.signal);
+          if (seq !== state.searchSeq) return;
+          elements = fresh.map(slim);
+          cachePut(center, radiusKm, elements);
+        }
         state.raw = { lat: center.lat, lon: center.lon, radiusKm, elements };
       }
 
