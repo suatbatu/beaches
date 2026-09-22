@@ -6,6 +6,10 @@
 
   const CONFIG = window.HELLO_BEACHES_CONFIG || {};
   const FLICKR_API_KEY = String(CONFIG.flickrApiKey || '').trim();
+  const GOOGLE_KEY = String(CONFIG.googleMapsApiKey || '').trim();
+  const clampInt = (v, lo, hi, dflt) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
+  const GOOGLE_PHOTO_LIMIT = clampInt(CONFIG.googlePhotoLimit, 1, 5, 2);
+  const GOOGLE_DAILY_BUDGET = clampInt(CONFIG.googleDailyBudget, 1, 500, 20);
 
   const OVERPASS_MIRRORS = [
     'https://overpass-api.de/api/interpreter',
@@ -37,6 +41,11 @@
   const COMMONS_LIMIT = 30;
   const WIKI_RADIUS_M = 1000;
   const PHOTO_MAX = 10;
+  const PLACES = 'https://places.googleapis.com/v1';
+  const GOOGLE_CACHE_KEY = 'beaches:google:v1';
+  const GOOGLE_BUDGET_KEY = 'beaches:google:budget';
+  const GOOGLE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;   // Google allows caching place data for 30 days
+  const GOOGLE_CACHE_MAX = 200;
 
   const els = {
     locateBtn: document.getElementById('locate-btn'),
@@ -584,7 +593,10 @@
     return '<div class="popup">' +
       (photo
         ? '<a class="popup-photo" href="' + esc(photo.page) + '" target="_blank" rel="noopener">' +
-            '<img src="' + esc(photo.thumb) + '" alt="' + esc(photo.title) + '"></a>'
+            '<img src="' + esc(photo.thumb) + '" alt="' + esc(photo.title) + '"></a>' +
+          (photo.kind === 'google'
+            ? '<div class="popup-google">' + (photo.artist ? '<span class="popup-author">Photo: ' + esc(photo.artist) + '</span>' : '') + GOOGLE_LOGO_HTML + '</div>'
+            : '')
         : '') +
       '<div class="popup-name">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</div>' +
       '<div class="popup-dist">' + formatDistance(b.distanceKm) + ' ' + compassLabel(b.bearing) + ' of ' + esc(describeWhere()) + '</div>' +
@@ -853,6 +865,107 @@
       .sort((a, c) => c.score - a.score || a.index - c.index);
   }
 
+  /* Google Maps photos, only as a fallback when the free sources have nothing that looks like the beach.
+     Cost control, in three layers:
+       1. Text Search and Place Details are asked with "IDs only" field masks, which Google prices as
+          unlimited free. The only metered call is each photo image (Place Details Photos SKU).
+       2. At most GOOGLE_PHOTO_LIMIT photos per beach, GOOGLE_DAILY_BUDGET photo loads per browser per day,
+          and a 30-day cache of place lookups, so a beach is never looked up twice.
+       3. The hard guarantee lives in Google Cloud Console: a daily quota cap on the API (see README). */
+
+  function readGoogleCache() {
+    try { const raw = localStorage.getItem(GOOGLE_CACHE_KEY); const obj = raw ? JSON.parse(raw) : {}; return obj && typeof obj === 'object' ? obj : {}; }
+    catch (e) { return {}; }
+  }
+  function googleCacheGet(id) {
+    const e = readGoogleCache()[id];
+    return e && Date.now() - e.at < GOOGLE_CACHE_TTL_MS ? e : null;
+  }
+  function googleCachePut(id, entry) {
+    const all = readGoogleCache();
+    const now = Date.now();
+    const keys = Object.keys(all).filter((k) => now - all[k].at < GOOGLE_CACHE_TTL_MS).sort((a, c) => all[c].at - all[a].at);
+    const next = {};
+    for (const k of keys.slice(0, GOOGLE_CACHE_MAX - 1)) next[k] = all[k];
+    next[id] = entry;
+    try { localStorage.setItem(GOOGLE_CACHE_KEY, JSON.stringify(next)); } catch (e) { /* ignore */ }
+  }
+  // Returns how many of `wanted` photo loads this browser may still make today, and books them.
+  function googleBudgetTake(wanted) {
+    const day = new Date().toISOString().slice(0, 10);
+    let rec = { day, used: 0 };
+    try { const raw = localStorage.getItem(GOOGLE_BUDGET_KEY); const r = raw ? JSON.parse(raw) : null; if (r && r.day === day && typeof r.used === 'number') rec = r; } catch (e) { /* ignore */ }
+    const allowed = Math.max(0, Math.min(wanted, GOOGLE_DAILY_BUDGET - rec.used));
+    if (allowed > 0) {
+      rec.used += allowed;
+      try { localStorage.setItem(GOOGLE_BUDGET_KEY, JSON.stringify(rec)); } catch (e) { /* ignore */ }
+    }
+    return allowed;
+  }
+
+  async function googleCall(path, mask, body) {
+    const headers = { 'X-Goog-Api-Key': GOOGLE_KEY, 'X-Goog-FieldMask': mask };
+    const init = { headers };
+    if (body) { init.method = 'POST'; headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
+    const res = await fetchWithTimeout(PLACES + path, init, 15000, null);
+    if (!res.ok) throw new Error('Google Places HTTP ' + res.status);
+    return res.json();
+  }
+
+  // Find the beach's Google place (free, IDs only) and remember its photo names.
+  async function googleLookup(b) {
+    const d = b.name ? 0.01 : 0.003;   // about 1 km for a named beach, 300 m for an unnamed strip
+    const search = await googleCall('/places:searchText', 'places.id', {
+      textQuery: b.name || 'beach',
+      includedType: 'beach',
+      maxResultCount: 1,
+      locationRestriction: { rectangle: {
+        low: { latitude: b.lat - d, longitude: b.lon - d },
+        high: { latitude: b.lat + d, longitude: b.lon + d },
+      } },
+    });
+    const placeId = search && Array.isArray(search.places) && search.places[0] ? search.places[0].id : null;
+    if (!placeId) return { placeId: null, photos: [], at: Date.now() };
+    const details = await googleCall('/places/' + encodeURIComponent(placeId), 'id,photos');
+    const photos = (details && Array.isArray(details.photos) ? details.photos : []).slice(0, 10)
+      .filter((ph) => ph && typeof ph.name === 'string')
+      .map((ph) => {
+        const a = ph.authorAttributions && ph.authorAttributions[0] ? ph.authorAttributions[0] : {};
+        return {
+          name: ph.name,
+          author: String(a.displayName || ''),
+          authorUri: typeof a.uri === 'string' ? a.uri : '',
+          uri: typeof ph.googleMapsUri === 'string' ? ph.googleMapsUri : '',
+        };
+      });
+    return { placeId, photos, at: Date.now() };
+  }
+
+  async function fetchGooglePhotos(b) {
+    if (!GOOGLE_KEY) return [];
+    let entry = googleCacheGet(b.id);
+    if (!entry) {
+      entry = await googleLookup(b);
+      googleCachePut(b.id, entry);
+    }
+    if (!entry.placeId || !entry.photos.length) return [];
+    const allowed = googleBudgetTake(Math.min(entry.photos.length, GOOGLE_PHOTO_LIMIT));
+    if (allowed <= 0) { console.info('Google photo budget for today is used up; showing free sources only.'); return []; }
+    const placeLink = 'https://www.google.com/maps/place/?q=place_id:' + encodeURIComponent(entry.placeId);
+    return entry.photos.slice(0, allowed).map((ph) => ({
+      thumb: PLACES + '/' + ph.name + '/media?key=' + encodeURIComponent(GOOGLE_KEY) + '&maxWidthPx=400&maxHeightPx=400',
+      page: ph.uri || placeLink,
+      title: 'Google Maps photo',
+      artist: ph.author, authorUri: ph.authorUri || '', license: '', kind: 'google',
+    }));
+  }
+
+  // "Looks like the beach": linked on OSM, a Wikipedia article, a Flickr geo hit, or a Commons file
+  // whose title or categories carry a beach word.
+  function looksLikeBeach(ph) {
+    return ph.kind === 'osm' || ph.kind === 'wikipedia' || ph.kind === 'flickr' || (ph.kind === 'commons' && ph.score >= 3);
+  }
+
   async function collectPhotos(b) {
     const tokens = nameTokens(b.name || '');
     const langs = wikiLangs();
@@ -869,6 +982,13 @@
       out.push(ph);
       if (out.length >= PHOTO_MAX) break;
     }
+    if (GOOGLE_KEY && !out.some(looksLikeBeach)) {
+      const google = await fetchGooglePhotos(b).catch((err) => { console.warn('Google photos failed:', err && err.message); return []; });
+      if (google.length) {
+        const merged = google.concat(out.filter((ph) => !google.some((g) => g.thumb === ph.thumb)));
+        return merged.slice(0, PHOTO_MAX);
+      }
+    }
     if (!out.length && geoError) throw geoError;
     return out;
   }
@@ -880,7 +1000,9 @@
     return promise;
   }
 
-  const SOURCE_NAMES = { osm: 'OpenStreetMap', wikipedia: 'Wikipedia', commons: 'Wikimedia Commons', flickr: 'Flickr' };
+  const SOURCE_NAMES = { osm: 'OpenStreetMap', wikipedia: 'Wikipedia', commons: 'Wikimedia Commons', flickr: 'Flickr', google: 'Google Maps' };
+  // Google requires its logo next to Places content shown away from a Google map.
+  const GOOGLE_LOGO_HTML = '<span class="google-badge"><img class="google-logo" src="assets/google_white.png" alt="Powered by Google" width="59" height="20"></span>';
 
   async function showPhotos(b, li) {
     let box = li.querySelector('.result-photos');
@@ -917,6 +1039,12 @@
       img.decoding = 'async';
       img.addEventListener('error', () => a.remove(), { once: true });
       a.appendChild(img);
+      if (ph.kind === 'google' && ph.artist) {
+        const by = document.createElement('span');
+        by.className = 'photo-author';
+        by.textContent = ph.artist;
+        a.appendChild(by);
+      }
       box.appendChild(a);
     }
     const sources = [];
@@ -924,6 +1052,7 @@
     const credit = document.createElement('span');
     credit.className = 'photo-credit';
     credit.textContent = sources.join(', ') + ' · within 1 km';
+    if (photos.some((ph) => ph.kind === 'google')) credit.insertAdjacentHTML('beforeend', ' ' + GOOGLE_LOGO_HTML);
     box.appendChild(credit);
 
     const m = markersById.get(b.id);
