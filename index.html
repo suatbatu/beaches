@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Beaches</title>
+  <meta name="description" content="Find the beaches nearest to you, sorted by distance, with directions.">
+  <meta name="theme-color" content="#0E8C86">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230E8C86'/%3E%3Cpath d='M4 20c4-3 8-3 12 0s8 3 12 0v8H4z' fill='%23E3B96B'/%3E%3Ccircle cx='22' cy='10' r='4' fill='%23F2F7F5'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Instrument+Sans:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" crossorigin="">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <aside class="panel">
+      <header class="brand">
+        <h1 class="wordmark">Beaches</h1>
+        <p class="tagline">Nearest sand, sorted by distance.</p>
+      </header>
+
+      <section class="controls" aria-label="Where to search">
+        <button id="locate-btn" class="btn btn-primary" type="button">
+          <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3" fill="currentColor"/><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 0v4M10 16v4M0 10h4M16 10h4" stroke="currentColor" stroke-width="1.8"/></svg>
+          Use my location
+        </button>
+
+        <form id="search-form" class="search" autocomplete="off">
+          <label for="place-input" class="visually-hidden">Search a place</label>
+          <input id="place-input" name="place" type="search" placeholder="Search a place, e.g. Bodrum" enterkeyhint="search" spellcheck="false">
+          <button class="btn" type="submit">Go</button>
+        </form>
+
+        <div class="radius-row">
+          <label for="radius-select">Within</label>
+          <select id="radius-select">
+            <option value="5">5 km</option>
+            <option value="10">10 km</option>
+            <option value="25" selected>25 km</option>
+            <option value="50">50 km</option>
+            <option value="100">100 km</option>
+          </select>
+          <span class="hint">or tap anywhere on the map</span>
+        </div>
+      </section>
+
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+
+      <div id="empty" class="empty">
+        <p>Try a place to see how it works:</p>
+        <div class="try-row" id="try-row">
+          <button type="button" class="chip chip-btn" data-place="Bodrum">Bodrum</button>
+          <button type="button" class="chip chip-btn" data-place="Antalya">Antalya</button>
+          <button type="button" class="chip chip-btn" data-place="Lisbon">Lisbon</button>
+          <button type="button" class="chip chip-btn" data-place="Sydney">Sydney</button>
+        </div>
+      </div>
+
+      <ol id="results" class="results" aria-label="Beaches near you"></ol>
+
+      <footer class="credits">
+        Beach data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors.
+        Missing a beach? <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">Add it on OSM</a>.
+      </footer>
+    </aside>
+
+    <div id="map" class="map" role="region" aria-label="Map of nearby beaches"></div>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" crossorigin=""></script>
+  <script src="app.js"></script>
+</body>
+</html>
