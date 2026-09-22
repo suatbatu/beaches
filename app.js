@@ -1,7 +1,11 @@
-/* Beaches — nearby beach finder.
-   Data: OpenStreetMap via Overpass (natural=beach). Geocoding: Nominatim. Map: Leaflet. */
+/* Hello Beaches — nearby beach finder.
+   Data: OpenStreetMap via Overpass (natural=beach). Geocoding: Nominatim. Map: Leaflet.
+   Photos: Flickr when a key is set in config.js, otherwise Wikimedia Commons. */
 (function () {
   'use strict';
+
+  const CONFIG = window.HELLO_BEACHES_CONFIG || {};
+  const FLICKR_API_KEY = String(CONFIG.flickrApiKey || '').trim();
 
   const OVERPASS_MIRRORS = [
     'https://overpass-api.de/api/interpreter',
@@ -13,15 +17,20 @@
   const RADII_KM = [5, 10, 25, 50, 100];
   const MAX_LIST = 100;
   const MAX_MARKERS = 250;
-  const REQUEST_TIMEOUT_MS = 30000;  // per mirror
-  const HEDGE_MS = 6000;             // ask the next mirror too if the current one is this slow
-  const RETRY_DELAYS_MS = [3000, 8000];   // extra attempts after every mirror failed
+  const REQUEST_TIMEOUT_MS = 20000;       // per request
+  const HEDGE_MS = 4000;                  // ask the next mirror too if the current one is this slow
+  const SAME_MIRROR_RETRIES = 2;          // Overpass answers 5xx when momentarily full; it clears in seconds
+  const SAME_MIRROR_RETRY_MS = 2000;
+  const DEAD_MIRROR_MS = 10 * 60 * 1000;  // skip a mirror that timed out, for this long
+  const RETRY_DELAYS_MS = [3000, 8000];   // extra rounds after every mirror failed
   const STORAGE_KEY = 'beaches:last';
   const MIRROR_KEY = 'beaches:mirror';
   const CACHE_KEY = 'beaches:cache';
   const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
   const CACHE_MAX = 6;
   const COMMONS = 'https://commons.wikimedia.org/w/api.php';
+  const FLICKR = 'https://api.flickr.com/services/rest/';
+  const PHOTO_SOURCE_NAME = FLICKR_API_KEY ? 'Flickr' : 'Wikimedia Commons';
   const PHOTO_RADIUS_M = 600;
   const PHOTO_LIMIT = 8;
 
@@ -44,6 +53,7 @@
     raw: null,         // last Overpass answer: { lat, lon, radiusKm, elements }
     selectedId: null,
     searchSeq: 0,
+    searchNote: '',    // extra words for the busy status, e.g. while retrying
     abort: null,
   };
 
@@ -199,9 +209,11 @@
 
   function orderedMirrors() {
     const preferred = getPreferredMirror();
-    return preferred && OVERPASS_MIRRORS.includes(preferred)
+    const all = preferred && OVERPASS_MIRRORS.includes(preferred)
       ? [preferred].concat(OVERPASS_MIRRORS.filter((m) => m !== preferred))
       : OVERPASS_MIRRORS.slice();
+    const alive = all.filter((m) => !isDead(m));
+    return alive.length ? alive : all;
   }
 
   async function fetchFromMirror(url, query, signal) {
@@ -210,65 +222,88 @@
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'data=' + encodeURIComponent(query),
     }, REQUEST_TIMEOUT_MS, signal);
-    if (!res.ok) throw new Error('HTTP ' + res.status + ' from ' + url);
+    if (!res.ok) {
+      const err = new Error('HTTP ' + res.status + ' from ' + url);
+      err.status = res.status;
+      throw err;
+    }
     const json = await res.json();
     if (!json || !Array.isArray(json.elements)) throw new Error('Unexpected response from ' + url);
     return json.elements;
   }
 
-  // Ask the preferred mirror first. If it fails, or is still silent after HEDGE_MS, ask the next one
-  // as well. The first good answer wins and the others are cancelled.
+  const deadMirrors = new Map();   // url -> when it last timed out
+  const markDead = (url) => deadMirrors.set(url, Date.now());
+  const isDead = (url) => deadMirrors.has(url) && Date.now() - deadMirrors.get(url) < DEAD_MIRROR_MS;
+
+  // Ask the preferred mirror first; if it is silent for HEDGE_MS, ask the next one as well.
+  // A mirror that answers 5xx is asked again after a short pause (Overpass says 504 while it is
+  // momentarily full), a mirror that times out is skipped for a while. First good answer wins.
   function fetchBeaches(center, radiusKm, signal) {
     const query = buildQuery(center, Math.round(radiusKm * 1000));
     const mirrors = orderedMirrors();
 
     return new Promise((resolve, reject) => {
-      const controllers = [];
-      let started = 0;
+      const controllers = new Set();
+      const timers = new Set();
+      let nextMirror = 0;
       let pending = 0;
       let settled = false;
       let lastError = null;
-      let hedgeTimer = null;
 
       const finish = (fn, value) => {
         if (settled) return;
         settled = true;
-        clearTimeout(hedgeTimer);
+        timers.forEach((t) => clearTimeout(t));
         signal.removeEventListener('abort', onAbort);
         controllers.forEach((c) => c.abort());
         fn(value);
       };
       const onAbort = () => finish(reject, signal.reason || new DOMException('Aborted', 'AbortError'));
-
-      const scheduleHedge = () => {
-        clearTimeout(hedgeTimer);
-        if (settled || started >= mirrors.length) return;
-        hedgeTimer = setTimeout(() => { startNext(); scheduleHedge(); }, HEDGE_MS);
+      const maybeGiveUp = () => {
+        if (!settled && pending === 0 && timers.size === 0 && nextMirror >= mirrors.length) {
+          finish(reject, lastError || new Error('All Overpass mirrors failed'));
+        }
+      };
+      const later = (fn, ms) => {
+        const t = setTimeout(() => { timers.delete(t); fn(); maybeGiveUp(); }, ms);
+        timers.add(t);
       };
 
-      const startNext = () => {
-        if (settled || started >= mirrors.length) return;
-        const url = mirrors[started++];
+      const ask = (url, tries) => {
+        if (settled) return;
         const ctrl = new AbortController();
-        controllers.push(ctrl);
+        controllers.add(ctrl);
         pending++;
+        const t0 = Date.now();
         fetchFromMirror(url, query, ctrl.signal).then(
           (elements) => { setPreferredMirror(url); finish(resolve, elements); },
           (err) => {
+            controllers.delete(ctrl);
             pending--;
             if (settled) return;
             lastError = err;
+            const quick = Date.now() - t0 < REQUEST_TIMEOUT_MS - 500;
             console.warn('Overpass mirror failed:', url, err && err.message);
-            if (started < mirrors.length) { startNext(); scheduleHedge(); }
-            else if (pending === 0) finish(reject, lastError || new Error('All Overpass mirrors failed'));
+            if (quick && err && err.status >= 500 && tries < SAME_MIRROR_RETRIES) {
+              later(() => ask(url, tries + 1), SAME_MIRROR_RETRY_MS);
+            } else {
+              if (!quick) markDead(url);
+              startNext();
+            }
+            maybeGiveUp();
           }
         );
+      };
+      const startNext = () => {
+        if (settled || nextMirror >= mirrors.length) return;
+        ask(mirrors[nextMirror++], 0);
+        if (nextMirror < mirrors.length) later(startNext, HEDGE_MS);
       };
 
       if (signal.aborted) { onAbort(); return; }
       signal.addEventListener('abort', onAbort, { once: true });
       startNext();
-      scheduleHedge();
     });
   }
 
@@ -290,17 +325,21 @@
     try { const raw = localStorage.getItem(CACHE_KEY); const arr = raw ? JSON.parse(raw) : []; return Array.isArray(arr) ? arr : []; }
     catch (e) { return []; }
   }
+  // Any fresh entry whose circle fully covers the requested one will do; results are filtered by distance.
   function cacheGet(center, radiusKm) {
-    const key = cacheKey(center, radiusKm);
     const now = Date.now();
-    const hit = readCache().find((e) => e && e.key === key && Array.isArray(e.elements) && now - e.at < CACHE_TTL_MS);
-    return hit ? hit.elements : null;
+    const fresh = readCache().filter((e) => e && Array.isArray(e.elements) && now - e.at < CACHE_TTL_MS &&
+      typeof e.lat === 'number' && typeof e.lon === 'number' && typeof e.radiusKm === 'number');
+    const covering = fresh.filter((e) => haversineKm({ lat: e.lat, lon: e.lon }, center) + radiusKm <= e.radiusKm + 0.01);
+    if (!covering.length) return null;
+    covering.sort((a, b) => a.radiusKm - b.radiusKm);   // tightest match first
+    return covering[0].elements;
   }
   function cachePut(center, radiusKm, elements) {
     const key = cacheKey(center, radiusKm);
     const now = Date.now();
     const entries = readCache().filter((e) => e && e.key !== key && now - e.at < CACHE_TTL_MS);
-    entries.unshift({ key, at: now, elements });
+    entries.unshift({ key, lat: center.lat, lon: center.lon, radiusKm, at: now, elements });
     for (let n = Math.min(entries.length, CACHE_MAX); n > 0; n--) {
       try { localStorage.setItem(CACHE_KEY, JSON.stringify(entries.slice(0, n))); return; }
       catch (e) { /* over quota: keep fewer entries */ }
@@ -324,7 +363,7 @@
         if (signal.aborted || attempt >= RETRY_DELAYS_MS.length) throw err;
         const delay = RETRY_DELAYS_MS[attempt++];
         console.warn('Every Overpass mirror failed; retrying in ' + delay + ' ms');
-        setStatus('Beach servers are busy. Retrying\u2026', { kind: 'busy' });
+        state.searchNote = 'Every map data server failed once; trying again.';
         await sleep(delay, signal);
       }
     }
@@ -380,7 +419,18 @@
     const center = state.center;
     const radiusKm = state.radiusKm;
     const where = describeWhere();
-    setStatus('Searching within ' + radiusKm + ' km of ' + where + '…', { kind: 'busy' });
+    const t0 = Date.now();
+    state.searchNote = '';
+    const tick = () => {
+      const secs = Math.round((Date.now() - t0) / 1000);
+      let text = 'Searching within ' + radiusKm + ' km of ' + where + '…';
+      if (secs >= 4) text += ' ' + secs + ' s.';
+      if (state.searchNote) text += ' ' + state.searchNote;
+      else if (secs >= 8) text += ' The OpenStreetMap data servers are busy right now; the page itself is fine.';
+      setStatus(text, { kind: 'busy' });
+    };
+    tick();
+    const ticker = setInterval(tick, 1000);
     els.results.classList.add('is-loading');
 
     try {
@@ -408,7 +458,7 @@
       for (const el of elements) {
         const b = normalize(el, center);
         if (!b || seen.has(b.id)) continue;
-        if (reusable && b.distanceKm > radiusKm) continue;
+        if (b.distanceKm > radiusKm) continue;
         seen.add(b.id);
         beaches.push(b);
       }
@@ -435,6 +485,7 @@
       setStatus('The beach data service didn’t answer. Check your connection and try again.',
         { kind: 'error', action: { label: 'Retry', onClick: runSearch } });
     } finally {
+      clearInterval(ticker);
       if (seq === state.searchSeq) els.results.classList.remove('is-loading');
     }
   }
@@ -583,11 +634,21 @@
       const li = els.results.querySelector('[data-id="' + CSS.escape(id) + '"]');
       if (li) li.scrollIntoView({ block: 'nearest', behavior: reducedMotion ? 'auto' : 'smooth' });
     } else {
-      // Fly to the beach first, then open its popup so it lands inside the view.
-      if (m) map.once('moveend', () => { if (state.selectedId === id) m.openPopup(); });
+      // Fly to the beach first, then open its popup so it lands inside the view. The listener is
+      // registered after flyTo so a 'moveend' from an interrupted earlier animation cannot trigger it.
       const zoom = Math.max(map.getZoom(), 14);
-      if (reducedMotion) map.setView([b.lat, b.lon], zoom);
-      else map.flyTo([b.lat, b.lon], zoom, { duration: 0.6 });
+      const openIt = () => { if (state.selectedId === id && markersById.get(id) === m && m) m.openPopup(); };
+      if (reducedMotion) {
+        map.setView([b.lat, b.lon], zoom);
+        openIt();
+      } else {
+        map.flyTo([b.lat, b.lon], zoom, { duration: 0.6 });
+        // Background tabs pause animation frames, so 'moveend' may never come; open anyway after a beat.
+        let opened = false;
+        const openOnce = () => { if (opened) return; opened = true; map.off('moveend', openOnce); openIt(); };
+        map.once('moveend', openOnce);
+        setTimeout(openOnce, 1500);
+      }
     }
   }
 
@@ -597,6 +658,45 @@
 
   function fetchPhotos(b) {
     if (photosById.has(b.id)) return photosById.get(b.id);
+    const promise = (FLICKR_API_KEY ? fetchFlickrPhotos(b) : fetchCommonsPhotos(b))
+      .catch((err) => { photosById.delete(b.id); throw err; });
+    photosById.set(b.id, promise);
+    return promise;
+  }
+
+  const FLICKR_LICENSES = {
+    '0': 'All rights reserved', '1': 'CC BY-NC-SA', '2': 'CC BY-NC', '3': 'CC BY-NC-ND', '4': 'CC BY',
+    '5': 'CC BY-SA', '6': 'CC BY-ND', '7': 'No known copyright restrictions', '8': 'US Government work',
+    '9': 'CC0', '10': 'Public domain',
+  };
+
+  async function fetchFlickrPhotos(b) {
+    const params = new URLSearchParams({
+      method: 'flickr.photos.search', api_key: FLICKR_API_KEY, format: 'json', nojsoncallback: '1',
+      lat: b.lat.toFixed(6), lon: b.lon.toFixed(6), radius: String(PHOTO_RADIUS_M / 1000), radius_units: 'km',
+      has_geo: '1', min_taken_date: '2000-01-01 00:00:00',   // Flickr insists on a limiting parameter next to geo
+      content_type: '1', safe_search: '1', sort: 'interestingness-desc', per_page: String(PHOTO_LIMIT),
+      extras: 'url_n,url_m,owner_name,license',
+    });
+    const res = await fetchWithTimeout(FLICKR + '?' + params.toString(), {}, 15000, null);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const json = await res.json();
+    if (!json || json.stat !== 'ok') throw new Error('Flickr: ' + (json && json.message ? json.message : 'unexpected response'));
+    const list = json.photos && Array.isArray(json.photos.photo) ? json.photos.photo : [];
+    return list.map((ph) => {
+      const thumb = ph.url_n || ph.url_m;
+      if (!thumb || !ph.id || !ph.owner) return null;
+      return {
+        thumb,
+        page: 'https://www.flickr.com/photos/' + encodeURIComponent(ph.owner) + '/' + encodeURIComponent(ph.id),
+        title: String(ph.title || 'Untitled'),
+        artist: String(ph.ownername || ''),
+        license: FLICKR_LICENSES[String(ph.license)] || '',
+      };
+    }).filter(Boolean);
+  }
+
+  function fetchCommonsPhotos(b) {
     const params = new URLSearchParams({
       action: 'query', format: 'json', origin: '*',
       generator: 'geosearch', ggscoord: b.lat.toFixed(6) + '|' + b.lon.toFixed(6),
@@ -604,7 +704,7 @@
       prop: 'imageinfo', iiprop: 'url|mime|extmetadata', iiurlwidth: '320',
       iiextmetadatafilter: 'Artist|LicenseShortName',
     });
-    const promise = fetchWithTimeout(COMMONS + '?' + params.toString(), {}, 15000, null)
+    return fetchWithTimeout(COMMONS + '?' + params.toString(), {}, 15000, null)
       .then((res) => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then((json) => {
         const pages = json && json.query && json.query.pages ? Object.values(json.query.pages) : [];
@@ -620,10 +720,7 @@
             license: md.LicenseShortName ? htmlToText(md.LicenseShortName.value) : '',
           };
         }).filter(Boolean);
-      })
-      .catch((err) => { photosById.delete(b.id); throw err; });
-    photosById.set(b.id, promise);
-    return promise;
+      });
   }
 
   async function showPhotos(b, li) {
@@ -644,7 +741,7 @@
     if (state.selectedId !== b.id || !li.isConnected) return;
     box.textContent = '';
     if (photos.length === 0) {
-      box.textContent = 'No geo-tagged photos on Wikimedia Commons yet.';
+      box.textContent = 'No geo-tagged photos on ' + PHOTO_SOURCE_NAME + ' yet.';
       return;
     }
     for (const ph of photos) {
@@ -664,7 +761,7 @@
     }
     const credit = document.createElement('span');
     credit.className = 'photo-credit';
-    credit.textContent = 'Wikimedia Commons, within ' + PHOTO_RADIUS_M + ' m';
+    credit.textContent = PHOTO_SOURCE_NAME + ', within ' + PHOTO_RADIUS_M + ' m';
     box.appendChild(credit);
 
     const m = markersById.get(b.id);

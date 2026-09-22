@@ -1,16 +1,27 @@
-# Beaches
+# Hello Beaches
 
 Nearest sand, sorted by distance.
 
-A single-page beach finder: share your location, search a place, or tap the map, and Beaches lists every beach within your chosen radius, closest first, with the direction it lies in and a one-tap link for directions.
+A single-page beach finder: share your location, search a place, or tap the map, and Hello Beaches lists every beach within your chosen radius, closest first, with the direction it lies in and a one-tap link for directions.
 
 ## How it works
 
 - **Beach data** comes live from OpenStreetMap (`natural=beach`) through the Overpass API. Several public mirrors are tried in parallel so one slow server does not stall the search.
 - **Place search** uses Nominatim geocoding.
-- **Photos**: selecting a beach loads geo-tagged photos taken within 600 m of it from Wikimedia Commons, with a link to each file page for author and licence. Named beaches also get an Instagram hashtag link; Instagram has no public API for place photos, so that link is the closest ToS-compliant option.
+- **Photos**: selecting a beach loads geo-tagged photos taken within 600 m of it. With a Flickr API key in `config.js` they come from Flickr; without one, from Wikimedia Commons. Each photo links to its page for author and licence. Named beaches also get an Instagram hashtag link; Instagram has no public API for place photos, so that link is the closest ToS-compliant option.
 - **Map** is Leaflet with OpenStreetMap tiles. Dark mode follows your system setting.
-- No build step, no API keys, no backend. Open `index.html` from any static host.
+- No build step, no backend. Open `index.html` from any static host. The only optional key is Flickr's.
+
+## Flickr photos
+
+1. Create a key at https://www.flickr.com/services/apps/create/ (non-commercial).
+2. Put it in `config.js` as `flickrApiKey`, commit, push. Pages redeploys in under a minute.
+
+The key sits in a public page, which is how Flickr's client-side apps work; do not reuse a secret.
+
+## When it feels slow
+
+The page loads in well under a second. What can take long is the Overpass service that answers beach queries: it is a shared public service and sometimes replies "busy" or hangs. Hello Beaches asks several mirrors, re-asks a busy one after two seconds, skips one that timed out, and keeps a 24-hour cache of searches, so repeat visits are instant.
 
 ## Run locally
 

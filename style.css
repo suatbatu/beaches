@@ -1,4 +1,4 @@
-/* Beaches — nearest sand, sorted by distance. */
+/* Hello Beaches — nearest sand, sorted by distance. */
 
 :root {
   --bg: #F2F7F5;
@@ -150,6 +150,8 @@ body {
   font-variation-settings: "opsz" 96;
   color: var(--ink);
 }
+
+.wordmark-hello { font-weight: 500; color: var(--accent); }
 
 .wordmark::after {
   content: "";
