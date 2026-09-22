@@ -21,6 +21,9 @@
   const CACHE_KEY = 'beaches:cache';
   const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
   const CACHE_MAX = 6;
+  const COMMONS = 'https://commons.wikimedia.org/w/api.php';
+  const PHOTO_RADIUS_M = 600;
+  const PHOTO_LIMIT = 8;
 
   const els = {
     locateBtn: document.getElementById('locate-btn'),
@@ -119,6 +122,19 @@
 
   function directionsUrl(b) {
     return 'https://www.google.com/maps/dir/?api=1&destination=' + b.lat.toFixed(6) + ',' + b.lon.toFixed(6);
+  }
+
+  // Instagram offers no public API for place photos, so the closest link is the hashtag page.
+  function instagramTag(name) {
+    const slug = String(name)
+      .replace(/\u0131/g, 'i').replace(/\u00df/g, 'ss')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase().replace(/[^a-z0-9]/g, '');
+    return slug.length >= 4 ? slug : null;
+  }
+
+  function htmlToText(html) {
+    return (new DOMParser().parseFromString(String(html), 'text/html').body.textContent || '').trim();
   }
 
   function loadStored() {
@@ -477,6 +493,7 @@
       li.setAttribute('role', 'button');
       li.setAttribute('aria-label', (b.name || 'Unnamed beach') + ', ' + formatDistance(b.distanceKm) + ' ' + compassLabel(b.bearing));
       const deg = Math.round(b.bearing);
+      const igTag = b.name ? instagramTag(b.name) : null;
       li.innerHTML =
         '<div class="result-main">' +
           '<h3 class="result-name' + (b.name ? '' : ' is-unnamed') + '">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</h3>' +
@@ -494,14 +511,19 @@
         '<div class="result-actions">' +
           '<a class="link-dir" href="' + directionsUrl(b) + '" target="_blank" rel="noopener">Directions</a>' +
           '<a class="link-osm" href="https://www.openstreetmap.org/' + b.osmType + '/' + b.osmId + '" target="_blank" rel="noopener">View on OSM</a>' +
+          (igTag ? '<a class="link-osm" href="https://www.instagram.com/explore/tags/' + igTag + '/" target="_blank" rel="noopener">Instagram</a>' : '') +
         '</div>';
       frag.appendChild(li);
     }
     els.results.replaceChildren(frag);
   }
 
-  function popupHtml(b) {
+  function popupHtml(b, photo) {
     return '<div class="popup">' +
+      (photo
+        ? '<a class="popup-photo" href="' + esc(photo.page) + '" target="_blank" rel="noopener">' +
+            '<img src="' + esc(photo.thumb) + '" alt="' + esc(photo.title) + '"></a>'
+        : '') +
       '<div class="popup-name">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</div>' +
       '<div class="popup-dist">' + formatDistance(b.distanceKm) + ' ' + compassLabel(b.bearing) + ' of ' + esc(describeWhere()) + '</div>' +
       '<a class="link-dir" href="' + directionsUrl(b) + '" target="_blank" rel="noopener">Directions</a>' +
@@ -513,7 +535,7 @@
     markersById.clear();
     for (const b of state.beaches.slice(0, MAX_MARKERS)) {
       const m = L.marker([b.lat, b.lon], { icon: beachIcon(false), title: b.name || 'Unnamed beach', riseOnHover: true, keyboard: false });
-      m.bindPopup(popupHtml(b), { closeButton: false, offset: [0, -6] });
+      m.bindPopup(popupHtml(b), { closeButton: false, offset: [0, -6], minWidth: 200, maxWidth: 260 });
       m.on('click', () => select(b.id, 'map'));
       m.addTo(markersLayer);
       markersById.set(b.id, m);
@@ -548,7 +570,14 @@
       m.setZIndexOffset(1000);
     }
 
-    for (const li of els.results.children) li.classList.toggle('is-selected', li.dataset.id === id);
+    let selectedLi = null;
+    for (const li of els.results.children) {
+      const on = li.dataset.id === id;
+      li.classList.toggle('is-selected', on);
+      if (on) selectedLi = li;
+      else { const box = li.querySelector('.result-photos'); if (box) box.remove(); }
+    }
+    if (selectedLi) showPhotos(b, selectedLi);
 
     if (source === 'map') {
       const li = els.results.querySelector('[data-id="' + CSS.escape(id) + '"]');
@@ -560,6 +589,86 @@
       if (reducedMotion) map.setView([b.lat, b.lon], zoom);
       else map.flyTo([b.lat, b.lon], zoom, { duration: 0.6 });
     }
+  }
+
+  /* ---------- Photos (Wikimedia Commons, geo-tagged near the beach) ---------- */
+
+  const photosById = new Map();   // beach id -> Promise<photo[]>
+
+  function fetchPhotos(b) {
+    if (photosById.has(b.id)) return photosById.get(b.id);
+    const params = new URLSearchParams({
+      action: 'query', format: 'json', origin: '*',
+      generator: 'geosearch', ggscoord: b.lat.toFixed(6) + '|' + b.lon.toFixed(6),
+      ggsradius: String(PHOTO_RADIUS_M), ggslimit: String(PHOTO_LIMIT), ggsnamespace: '6',
+      prop: 'imageinfo', iiprop: 'url|mime|extmetadata', iiurlwidth: '320',
+      iiextmetadatafilter: 'Artist|LicenseShortName',
+    });
+    const promise = fetchWithTimeout(COMMONS + '?' + params.toString(), {}, 15000, null)
+      .then((res) => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then((json) => {
+        const pages = json && json.query && json.query.pages ? Object.values(json.query.pages) : [];
+        return pages.map((pg) => {
+          const ii = pg.imageinfo && pg.imageinfo[0];
+          if (!ii || !ii.thumburl || !/^image\/(jpeg|png|webp|gif)$/.test(ii.mime || '')) return null;
+          const md = ii.extmetadata || {};
+          return {
+            thumb: ii.thumburl,
+            page: ii.descriptionurl || ('https://commons.wikimedia.org/wiki/' + encodeURIComponent(pg.title || '')),
+            title: String(pg.title || '').replace(/^File:/, '').replace(/\.[a-z0-9]+$/i, ''),
+            artist: md.Artist ? htmlToText(md.Artist.value) : '',
+            license: md.LicenseShortName ? htmlToText(md.LicenseShortName.value) : '',
+          };
+        }).filter(Boolean);
+      })
+      .catch((err) => { photosById.delete(b.id); throw err; });
+    photosById.set(b.id, promise);
+    return promise;
+  }
+
+  async function showPhotos(b, li) {
+    let box = li.querySelector('.result-photos');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'result-photos';
+      li.appendChild(box);
+    }
+    box.textContent = 'Loading photos\u2026';
+    let photos;
+    try {
+      photos = await fetchPhotos(b);
+    } catch (err) {
+      if (state.selectedId === b.id && li.isConnected) box.textContent = 'Photos couldn\u2019t be loaded right now.';
+      return;
+    }
+    if (state.selectedId !== b.id || !li.isConnected) return;
+    box.textContent = '';
+    if (photos.length === 0) {
+      box.textContent = 'No geo-tagged photos on Wikimedia Commons yet.';
+      return;
+    }
+    for (const ph of photos) {
+      const a = document.createElement('a');
+      a.className = 'photo';
+      a.href = ph.page;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.title = ph.title + (ph.artist ? ' \u2014 ' + ph.artist : '') + (ph.license ? ' (' + ph.license + ')' : '');
+      const img = document.createElement('img');
+      img.src = ph.thumb;
+      img.alt = ph.title;
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      a.appendChild(img);
+      box.appendChild(a);
+    }
+    const credit = document.createElement('span');
+    credit.className = 'photo-credit';
+    credit.textContent = 'Wikimedia Commons, within ' + PHOTO_RADIUS_M + ' m';
+    box.appendChild(credit);
+
+    const m = markersById.get(b.id);
+    if (m) m.setPopupContent(popupHtml(b, photos[0]));
   }
 
   /* ---------- Location & geocoding ---------- */
