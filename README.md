@@ -8,7 +8,7 @@ A single-page beach finder: share your location, search a place, or tap the map,
 
 - **Beach data** comes live from OpenStreetMap (`natural=beach`) through the Overpass API. Several public mirrors are tried in parallel so one slow server does not stall the search.
 - **Place search** uses Nominatim geocoding.
-- **Photos**: selecting a beach loads geo-tagged photos taken within 600 m of it. With a Flickr API key in `config.js` they come from Flickr; without one, from Wikimedia Commons. Each photo links to its page for author and licence. Named beaches also get an Instagram hashtag link; Instagram has no public API for place photos, so that link is the closest ToS-compliant option.
+- **Photos**: selecting a beach shows, in this order, photos the mapper linked on the beach's OpenStreetMap entry, Wikipedia articles about the beach (English plus your browser language), and geo-tagged Wikimedia Commons files within 1 km ranked so beach-looking titles and categories come before the town behind them. With a Flickr API key in `config.js`, Flickr replaces the Commons part. Each photo links to its page for author and licence. Named beaches also get Wikipedia and Instagram links where available; Instagram has no public API for place photos, so that link is the closest ToS-compliant option.
 - **Map** is Leaflet with OpenStreetMap tiles. Dark mode follows your system setting.
 - No build step, no backend. Open `index.html` from any static host. The only optional key is Flickr's.
 

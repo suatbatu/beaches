@@ -25,14 +25,18 @@
   const RETRY_DELAYS_MS = [3000, 8000];   // extra rounds after every mirror failed
   const STORAGE_KEY = 'beaches:last';
   const MIRROR_KEY = 'beaches:mirror';
-  const CACHE_KEY = 'beaches:cache';
+  const CACHE_KEY = 'beaches:cache:v2';
+  const OLD_CACHE_KEYS = ['beaches:cache'];
   const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
   const CACHE_MAX = 6;
   const COMMONS = 'https://commons.wikimedia.org/w/api.php';
   const FLICKR = 'https://api.flickr.com/services/rest/';
-  const PHOTO_SOURCE_NAME = FLICKR_API_KEY ? 'Flickr' : 'Wikimedia Commons';
-  const PHOTO_RADIUS_M = 600;
-  const PHOTO_LIMIT = 8;
+  const FLICKR_RADIUS_M = 600;
+  const FLICKR_LIMIT = 8;
+  const COMMONS_RADIUS_M = 1000;
+  const COMMONS_LIMIT = 30;
+  const WIKI_RADIUS_M = 1000;
+  const PHOTO_MAX = 10;
 
   const els = {
     locateBtn: document.getElementById('locate-btn'),
@@ -308,7 +312,8 @@
   }
 
   // Keep only what the UI needs so cached answers stay small.
-  const KEEP_TAGS = ['name', 'name:en', 'alt_name', 'surface', 'lifeguard', 'nudism', 'dog', 'wheelchair', 'fee', 'access'];
+  const KEEP_TAGS = ['name', 'name:en', 'alt_name', 'surface', 'lifeguard', 'nudism', 'dog', 'wheelchair', 'fee', 'access',
+    'image', 'wikimedia_commons', 'wikipedia', 'wikidata'];
   function slim(el) {
     const out = { type: el.type, id: el.id, tags: {} };
     if (el.type === 'node') { out.lat = el.lat; out.lon = el.lon; }
@@ -403,6 +408,10 @@
       osmType: el.type,
       osmId: el.id,
       name, lat, lon, features,
+      image: tags.image || null,
+      commonsFile: tags.wikimedia_commons || null,
+      wikipedia: tags.wikipedia || null,
+      wikidata: tags.wikidata || null,
       distanceKm: haversineKm(center, point),
       bearing: bearingDeg(center, point),
     };
@@ -545,6 +554,7 @@
       li.setAttribute('aria-label', (b.name || 'Unnamed beach') + ', ' + formatDistance(b.distanceKm) + ' ' + compassLabel(b.bearing));
       const deg = Math.round(b.bearing);
       const igTag = b.name ? instagramTag(b.name) : null;
+      const wikiRef = parseWikipediaTag(b.wikipedia);
       li.innerHTML =
         '<div class="result-main">' +
           '<h3 class="result-name' + (b.name ? '' : ' is-unnamed') + '">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</h3>' +
@@ -562,6 +572,7 @@
         '<div class="result-actions">' +
           '<a class="link-dir" href="' + directionsUrl(b) + '" target="_blank" rel="noopener">Directions</a>' +
           '<a class="link-osm" href="https://www.openstreetmap.org/' + b.osmType + '/' + b.osmId + '" target="_blank" rel="noopener">View on OSM</a>' +
+          (wikiRef ? '<a class="link-osm" href="' + esc(wikipediaUrl(wikiRef)) + '" target="_blank" rel="noopener">Wikipedia</a>' : '') +
           (igTag ? '<a class="link-osm" href="https://www.instagram.com/explore/tags/' + igTag + '/" target="_blank" rel="noopener">Instagram</a>' : '') +
         '</div>';
       frag.appendChild(li);
@@ -652,16 +663,132 @@
     }
   }
 
-  /* ---------- Photos (Wikimedia Commons, geo-tagged near the beach) ---------- */
+  /* ---------- Photos ----------
+     Order: photos the mapper linked on OpenStreetMap, then Wikipedia articles about the beach,
+     then geo-tagged Wikimedia Commons files (or Flickr when a key is set), ranked by how much
+     their title and categories look like a beach rather than the town behind it. */
 
   const photosById = new Map();   // beach id -> Promise<photo[]>
 
-  function fetchPhotos(b) {
-    if (photosById.has(b.id)) return photosById.get(b.id);
-    const promise = (FLICKR_API_KEY ? fetchFlickrPhotos(b) : fetchCommonsPhotos(b))
-      .catch((err) => { photosById.delete(b.id); throw err; });
-    photosById.set(b.id, promise);
-    return promise;
+  function normText(s) {
+    return String(s || '').replace(/ı/g, 'i').replace(/ß/g, 'ss')
+      .normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  }
+  const BEACH_WORDS = ['beach', 'plaj', 'kumsal', 'playa', 'praia', 'strand', 'plage', 'spiaggia', 'paralia', 'παραλια', 'пляж'];
+  const SHORE_WORDS = ['sea', 'deniz', 'bay', 'koy', 'cove', 'shore', 'coast', 'kiyi', 'sahil', 'lagoon', 'lagun', 'sand', 'kum'];
+
+  const hasWord = (text, words) => { const t = normText(text); return words.some((w) => t.includes(w)); };
+  // The name without its "beach" word: "Bodrum Halk Plajı" -> "bodrum halk", "Bondi Beach" -> "bondi".
+  function coreName(s) {
+    return normText(s).split(/[^a-z0-9Ͱ-ϿЀ-ӿ]+/)
+      .filter((t) => t && !BEACH_WORDS.some((w) => t.includes(w))).join(' ');
+  }
+  function nameTokens(name) { return coreName(name).split(' ').filter((t) => t.length >= 4); }
+
+  // A beach word in the title counts most; the beach's own name least, because a beach named after
+  // the town would otherwise pull in every photo of the town.
+  function relevance(text, tokens) {
+    const t = normText(text);
+    let score = 0;
+    if (BEACH_WORDS.some((w) => t.includes(w))) score += 3;
+    else if (SHORE_WORDS.some((w) => t.includes(w))) score += 1;
+    if (tokens.length) {
+      const hits = tokens.filter((tok) => t.includes(tok)).length;
+      if (hits === tokens.length) score += 2;
+      else if (hits) score += 1;
+    }
+    return score;
+  }
+  // An article is about the beach if its title carries a beach word or is the beach's name.
+  function wikiTitleFits(title, beachName) {
+    if (hasWord(title, BEACH_WORDS)) return true;
+    const core = coreName(beachName);
+    return !!core && coreName(title) === core;
+  }
+
+  function safeDecode(s) { try { return decodeURIComponent(s); } catch (e) { return s; } }
+  function commonsFileName(v) { return String(v || '').replace(/^(File|Image):/i, '').replace(/_/g, ' ').trim(); }
+  function commonsThumb(name) { return 'https://commons.wikimedia.org/wiki/Special:FilePath/' + encodeURIComponent(name) + '?width=320'; }
+  function commonsPage(name) { return 'https://commons.wikimedia.org/wiki/File:' + encodeURIComponent(name.replace(/ /g, '_')); }
+
+  const WIKI_LANG_RE = /^[a-z]{2,3}(-[a-z]+)?$/;
+  function wikiApi(lang) { return 'https://' + lang + '.wikipedia.org/w/api.php'; }
+  function wikiLangs() {
+    const local = String(navigator.language || '').toLowerCase().split('-')[0];
+    return local && local !== 'en' && WIKI_LANG_RE.test(local) ? ['en', local] : ['en'];
+  }
+  function parseWikipediaTag(v) {
+    const m = /^([A-Za-z]{2,3}(?:-[A-Za-z]+)?):(.+)$/.exec(String(v || '').trim());
+    if (!m || !WIKI_LANG_RE.test(m[1].toLowerCase())) return null;
+    return { lang: m[1].toLowerCase(), title: m[2].trim() };
+  }
+  function wikipediaUrl(ref) { return 'https://' + ref.lang + '.wikipedia.org/wiki/' + encodeURIComponent(ref.title.replace(/ /g, '_')); }
+
+  async function getJson(url) {
+    const res = await fetchWithTimeout(url, {}, 15000, null);
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' from ' + new URL(url).host);
+    return res.json();
+  }
+  function pagesOf(json) { return json && json.query && json.query.pages ? Object.values(json.query.pages) : []; }
+
+  function wikiPageToPhoto(pg) {
+    if (!pg || pg.missing != null || !pg.thumbnail || !pg.thumbnail.source) return null;
+    return { thumb: pg.thumbnail.source, page: pg.fullurl || '', title: 'Wikipedia: ' + pg.title, artist: '', license: '', kind: 'wikipedia' };
+  }
+
+  async function fetchWikipediaArticle(ref) {
+    const params = new URLSearchParams({
+      action: 'query', format: 'json', origin: '*', titles: ref.title, redirects: '1',
+      prop: 'pageimages|info', piprop: 'thumbnail', pithumbsize: '320', inprop: 'url',
+    });
+    return wikiPageToPhoto(pagesOf(await getJson(wikiApi(ref.lang) + '?' + params.toString()))[0]);
+  }
+
+  async function fetchWikipediaNear(lang, b) {
+    const params = new URLSearchParams({
+      action: 'query', format: 'json', origin: '*',
+      generator: 'geosearch', ggscoord: b.lat.toFixed(6) + '|' + b.lon.toFixed(6), ggsradius: String(WIKI_RADIUS_M), ggslimit: '10',
+      prop: 'pageimages|info', piprop: 'thumbnail', pithumbsize: '320', inprop: 'url',
+    });
+    return pagesOf(await getJson(wikiApi(lang) + '?' + params.toString()))
+      .filter((pg) => pg.title && wikiTitleFits(pg.title, b.name || ''))
+      .sort((a, c) => (a.index || 0) - (c.index || 0))
+      .map(wikiPageToPhoto).filter(Boolean);
+  }
+
+  async function fetchWikidataImage(qid) {
+    const params = new URLSearchParams({ action: 'wbgetclaims', format: 'json', origin: '*', entity: qid, property: 'P18' });
+    const json = await getJson('https://www.wikidata.org/w/api.php?' + params.toString());
+    const claim = json && json.claims && json.claims.P18 && json.claims.P18[0];
+    const name = claim && claim.mainsnak && claim.mainsnak.datavalue && claim.mainsnak.datavalue.value;
+    if (!name) return null;
+    return { thumb: commonsThumb(name), page: commonsPage(name), title: 'Photo linked via Wikidata', artist: '', license: '', kind: 'osm' };
+  }
+
+  // Photos the mapper attached to the beach itself.
+  async function fetchTaggedPhotos(b) {
+    const out = [];
+    const linked = (thumb, page) => out.push({ thumb, page, title: 'Photo linked from OpenStreetMap', artist: '', license: '', kind: 'osm' });
+    if (/^(File|Image):/i.test(String(b.commonsFile || ''))) {
+      const name = commonsFileName(b.commonsFile);
+      if (name) linked(commonsThumb(name), commonsPage(name));
+    }
+    const img = String(b.image || '').trim();
+    if (/^https:\/\/commons\.wikimedia\.org\/wiki\/File:/i.test(img)) {
+      const name = commonsFileName(safeDecode(img.split('/wiki/')[1] || ''));
+      if (name) linked(commonsThumb(name), img);
+    } else if (/^https:\/\/\S+\.(jpe?g|png|webp|gif)(\?\S*)?$/i.test(img)) {
+      linked(img, img);
+    }
+    const ref = parseWikipediaTag(b.wikipedia);
+    if (ref) {
+      const art = await fetchWikipediaArticle(ref).catch(() => null);
+      if (art) out.push(art);
+    } else if (/^Q\d+$/.test(String(b.wikidata || ''))) {
+      const wd = await fetchWikidataImage(b.wikidata).catch(() => null);
+      if (wd) out.push(wd);
+    }
+    return out;
   }
 
   const FLICKR_LICENSES = {
@@ -673,14 +800,12 @@
   async function fetchFlickrPhotos(b) {
     const params = new URLSearchParams({
       method: 'flickr.photos.search', api_key: FLICKR_API_KEY, format: 'json', nojsoncallback: '1',
-      lat: b.lat.toFixed(6), lon: b.lon.toFixed(6), radius: String(PHOTO_RADIUS_M / 1000), radius_units: 'km',
+      lat: b.lat.toFixed(6), lon: b.lon.toFixed(6), radius: String(FLICKR_RADIUS_M / 1000), radius_units: 'km',
       has_geo: '1', min_taken_date: '2000-01-01 00:00:00',   // Flickr insists on a limiting parameter next to geo
-      content_type: '1', safe_search: '1', sort: 'interestingness-desc', per_page: String(PHOTO_LIMIT),
+      content_type: '1', safe_search: '1', sort: 'interestingness-desc', per_page: String(FLICKR_LIMIT),
       extras: 'url_n,url_m,owner_name,license',
     });
-    const res = await fetchWithTimeout(FLICKR + '?' + params.toString(), {}, 15000, null);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const json = await res.json();
+    const json = await getJson(FLICKR + '?' + params.toString());
     if (!json || json.stat !== 'ok') throw new Error('Flickr: ' + (json && json.message ? json.message : 'unexpected response'));
     const list = json.photos && Array.isArray(json.photos.photo) ? json.photos.photo : [];
     return list.map((ph) => {
@@ -692,36 +817,70 @@
         title: String(ph.title || 'Untitled'),
         artist: String(ph.ownername || ''),
         license: FLICKR_LICENSES[String(ph.license)] || '',
+        kind: 'flickr',
       };
     }).filter(Boolean);
   }
 
-  function fetchCommonsPhotos(b) {
+  // Geo-tagged Commons files near the beach, beach-looking ones first, then by distance.
+  async function fetchCommonsPhotos(b, tokens) {
     const params = new URLSearchParams({
       action: 'query', format: 'json', origin: '*',
       generator: 'geosearch', ggscoord: b.lat.toFixed(6) + '|' + b.lon.toFixed(6),
-      ggsradius: String(PHOTO_RADIUS_M), ggslimit: String(PHOTO_LIMIT), ggsnamespace: '6',
-      prop: 'imageinfo', iiprop: 'url|mime|extmetadata', iiurlwidth: '320',
-      iiextmetadatafilter: 'Artist|LicenseShortName',
+      ggsradius: String(COMMONS_RADIUS_M), ggslimit: String(COMMONS_LIMIT), ggsnamespace: '6',
+      prop: 'imageinfo|categories', iiprop: 'url|mime|extmetadata', iiurlwidth: '320',
+      iiextmetadatafilter: 'Artist|LicenseShortName', clshow: '!hidden', cllimit: '500',
     });
-    return fetchWithTimeout(COMMONS + '?' + params.toString(), {}, 15000, null)
-      .then((res) => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
-      .then((json) => {
-        const pages = json && json.query && json.query.pages ? Object.values(json.query.pages) : [];
-        return pages.map((pg) => {
-          const ii = pg.imageinfo && pg.imageinfo[0];
-          if (!ii || !ii.thumburl || !/^image\/(jpeg|png|webp|gif)$/.test(ii.mime || '')) return null;
-          const md = ii.extmetadata || {};
-          return {
-            thumb: ii.thumburl,
-            page: ii.descriptionurl || ('https://commons.wikimedia.org/wiki/' + encodeURIComponent(pg.title || '')),
-            title: String(pg.title || '').replace(/^File:/, '').replace(/\.[a-z0-9]+$/i, ''),
-            artist: md.Artist ? htmlToText(md.Artist.value) : '',
-            license: md.LicenseShortName ? htmlToText(md.LicenseShortName.value) : '',
-          };
-        }).filter(Boolean);
-      });
+    return pagesOf(await getJson(COMMONS + '?' + params.toString()))
+      .map((pg) => {
+        const ii = pg.imageinfo && pg.imageinfo[0];
+        if (!ii || !ii.thumburl || !/^image\/(jpeg|png|webp|gif)$/.test(ii.mime || '')) return null;
+        const md = ii.extmetadata || {};
+        const cats = (pg.categories || []).map((c) => c.title).join(' ');
+        const name = commonsFileName(pg.title || '');
+        return {
+          thumb: ii.thumburl,
+          page: ii.descriptionurl || commonsPage(name),
+          title: name.replace(/\.[a-z0-9]+$/i, ''),
+          artist: md.Artist ? htmlToText(md.Artist.value) : '',
+          license: md.LicenseShortName ? htmlToText(md.LicenseShortName.value) : '',
+          kind: 'commons',
+          score: relevance(pg.title + ' ' + cats, tokens),
+          index: pg.index || 0,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, c) => c.score - a.score || a.index - c.index);
   }
+
+  async function collectPhotos(b) {
+    const tokens = nameTokens(b.name || '');
+    const langs = wikiLangs();
+    let geoError = null;
+    const jobs = [fetchTaggedPhotos(b).catch(() => [])]
+      .concat(langs.map((lang) => fetchWikipediaNear(lang, b).catch(() => [])))
+      .concat([(FLICKR_API_KEY ? fetchFlickrPhotos(b) : fetchCommonsPhotos(b, tokens)).catch((err) => { geoError = err; return []; })]);
+    const parts = await Promise.all(jobs);
+    const seen = new Set();
+    const out = [];
+    for (const ph of parts.flat()) {
+      if (!ph || !ph.thumb || seen.has(ph.thumb)) continue;
+      seen.add(ph.thumb);
+      out.push(ph);
+      if (out.length >= PHOTO_MAX) break;
+    }
+    if (!out.length && geoError) throw geoError;
+    return out;
+  }
+
+  function fetchPhotos(b) {
+    if (photosById.has(b.id)) return photosById.get(b.id);
+    const promise = collectPhotos(b).catch((err) => { photosById.delete(b.id); throw err; });
+    photosById.set(b.id, promise);
+    return promise;
+  }
+
+  const SOURCE_NAMES = { osm: 'OpenStreetMap', wikipedia: 'Wikipedia', commons: 'Wikimedia Commons', flickr: 'Flickr' };
 
   async function showPhotos(b, li) {
     let box = li.querySelector('.result-photos');
@@ -730,18 +889,18 @@
       box.className = 'result-photos';
       li.appendChild(box);
     }
-    box.textContent = 'Loading photos\u2026';
+    box.textContent = 'Loading photos…';
     let photos;
     try {
       photos = await fetchPhotos(b);
     } catch (err) {
-      if (state.selectedId === b.id && li.isConnected) box.textContent = 'Photos couldn\u2019t be loaded right now.';
+      if (state.selectedId === b.id && li.isConnected) box.textContent = 'Photos couldn’t be loaded right now.';
       return;
     }
     if (state.selectedId !== b.id || !li.isConnected) return;
     box.textContent = '';
     if (photos.length === 0) {
-      box.textContent = 'No geo-tagged photos on ' + PHOTO_SOURCE_NAME + ' yet.';
+      box.textContent = 'No photos found near this beach yet.';
       return;
     }
     for (const ph of photos) {
@@ -750,18 +909,21 @@
       a.href = ph.page;
       a.target = '_blank';
       a.rel = 'noopener';
-      a.title = ph.title + (ph.artist ? ' \u2014 ' + ph.artist : '') + (ph.license ? ' (' + ph.license + ')' : '');
+      a.title = ph.title + (ph.artist ? ' — ' + ph.artist : '') + (ph.license ? ' (' + ph.license + ')' : '');
       const img = document.createElement('img');
       img.src = ph.thumb;
       img.alt = ph.title;
       img.loading = 'lazy';
       img.decoding = 'async';
+      img.addEventListener('error', () => a.remove(), { once: true });
       a.appendChild(img);
       box.appendChild(a);
     }
+    const sources = [];
+    for (const ph of photos) { const n = SOURCE_NAMES[ph.kind]; if (n && !sources.includes(n)) sources.push(n); }
     const credit = document.createElement('span');
     credit.className = 'photo-credit';
-    credit.textContent = PHOTO_SOURCE_NAME + ', within ' + PHOTO_RADIUS_M + ' m';
+    credit.textContent = sources.join(', ') + ' · within 1 km';
     box.appendChild(credit);
 
     const m = markersById.get(b.id);
@@ -873,6 +1035,7 @@
   /* ---------- Boot ---------- */
 
   function init() {
+    for (const k of OLD_CACHE_KEYS) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
     const stored = loadStored();
     if (stored && typeof stored.lat === 'number' && typeof stored.lon === 'number' && isFinite(stored.lat) && isFinite(stored.lon)) {
       if (RADII_KM.includes(stored.radius)) {
