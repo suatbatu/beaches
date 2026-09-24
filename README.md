@@ -1,43 +1,61 @@
 # Hello Beaches
 
-Nearest sand, sorted by distance.
+Find your beach. Every beach around you, closest first, with photos, ratings and directions.
 
-A single-page beach finder: share your location, search a place, or tap the map, and Hello Beaches lists every beach within your chosen radius, closest first, with the direction it lies in and a one-tap link for directions.
+Share your location, search a place, or tap the map. Hello Beaches lists every beach within the radius you pick, closest first, with the direction it lies in. Open a beach to see its photos, its ratings, rate it yourself, and get directions.
+
+Live: https://suatbatu.github.io/beaches/
 
 ## How it works
 
-- **Beach data** comes live from OpenStreetMap (`natural=beach`) through the Overpass API. Several public mirrors are tried in parallel so one slow server does not stall the search.
+- **Beach data** comes live from OpenStreetMap (`natural=beach`) through the Overpass API. Several public mirrors are tried in parallel, and searches are cached for a day.
 - **Place search** uses Nominatim geocoding.
-- **Photos**: selecting a beach shows, in this order, photos the mapper linked on the beach's OpenStreetMap entry, Wikipedia articles about the beach (English plus your browser language), and geo-tagged Wikimedia Commons files within 1 km ranked so beach-looking titles and categories come before the town behind them. With a Flickr API key in `config.js`, Flickr replaces the Commons part. Each photo links to its page for author and licence. Named beaches also get Wikipedia and Instagram links where available; Instagram has no public API for place photos, so that link is the closest ToS-compliant option.
-- **Map** is Leaflet with OpenStreetMap tiles. Dark mode follows your system setting.
-- No build step, no backend. Open `index.html` from any static host. The only optional key is Flickr's.
+- **Map** is Leaflet drawing OpenFreeMap's vector styles through MapLibre: Positron in light mode, Dark in dark mode. OpenFreeMap is free with no key and no view limits. Browsers without WebGL get plain OpenStreetMap tiles.
+- **Photos**, in this order: photos linked on the beach's OpenStreetMap entry, Wikipedia articles about the beach, then geo-tagged Wikimedia Commons files within 1 km, ranked so beach photos come before the town behind them. Google Maps photos are a last resort, only when the site is connected to Google (below).
+- **Ratings**: every visitor can rate a beach from 1 to 5 stars. Without Supabase, a rating stays on the visitor's own device. With Supabase connected, ratings are shared and everyone sees the average. When Google is connected, each beach also shows its Google Maps rating.
+- **Design** follows Apple's web style: system San Francisco font (Inter elsewhere), frosted navigation bar, grouped lists, pill buttons, light and dark themes.
+- No build step. The site is static files; the optional backend is one Supabase project.
 
-## Flickr photos
+## Connect Supabase for shared ratings (free, about 10 minutes)
 
-1. Create a key at https://www.flickr.com/services/apps/create/ (non-commercial).
-2. Put it in `config.js` as `flickrApiKey`, commit, push. Pages redeploys in under a minute.
+1. Sign in at https://supabase.com with GitHub and create a new project on the free plan. No card is needed.
+2. Open **SQL Editor**, paste all of [`supabase/setup.sql`](supabase/setup.sql) and press **Run**. It is safe to run again later.
+3. Open **Project Settings > API Keys**. Copy the project URL and the **publishable** key (it starts with `sb_publishable_`). This key is meant to be public.
+4. Put both in [`config.js`](config.js) as `supabaseUrl` and `supabaseKey`, commit, push.
 
-The key sits in a public page, which is how Flickr's client-side apps work; do not reuse a secret.
+What the database does: visitors can only call two functions, one to rate a beach and one to read averages. The ratings table itself is closed to the public API. One browser has one vote per beach, and one connection can send at most 60 ratings an hour. Only a hash of the address is stored for that limit.
 
-## Google photos as a fallback (optional)
+Free Supabase projects pause after a week with no visits. The site keeps working while paused; ratings fall back to each visitor's device until you resume the project in the dashboard.
 
-When the free sources have nothing that looks like the beach, Hello Beaches can ask Google Maps for the beach's photos. It only does so if `googleMapsApiKey` is set in `config.js`. Three things keep this free:
+## Connect Google Maps for ratings and photos (optional, stays free)
 
-1. **Only photo image loads are metered.** The search that finds the beach and the details call that lists its photos are sent with "IDs only" field masks, which Google prices as unlimited free. Each photo image is one "Place Details Photos" event: 1,000 free per month, then $7 per 1,000.
-2. **The app rations itself.** At most `googlePhotoLimit` photos per beach (default 2), `googleDailyBudget` photo loads per browser per day (default 20), and every lookup is cached for 30 days.
-3. **A quota cap in Google Cloud makes overspend impossible.** A browser-side limit cannot stop someone who copies the key, so set the cap:
-   - Cloud Console → APIs & Services → Places API (New) → Quotas & System Limits.
-   - Find the "Requests per day" row for photos (named like "Place Photos requests per day"). If your console only shows one overall "Requests per day", cap that one instead.
-   - Edit it to **30**. 30 × 31 days = 930, under the 1,000 free photo loads. Google warns that enforcement lags a little, so do not set it to 32.
-   - Once the cap is reached, Google returns an error and the app quietly shows the free sources only. Nothing is billed.
+Google's rating and review count need a Google Maps Platform key. Google requires a billing account for that key, so the site never talks to Google directly. A small Supabase Edge Function holds the key and counts every Google call in the database. Once a month's count reaches 900 it refuses, which keeps usage under Google's free 1,000 per month and the bill at zero.
 
-Set up the key like this: create a Cloud project with billing enabled (required even at zero cost), enable **Places API (New)**, create an API key, restrict it to **Websites** with `https://suatbatu.github.io/*`, and restrict it to the Places API (New) only. Then put it in `config.js`, commit, push.
+| Google call | Google's free allowance | What the function allows |
+|---|---|---|
+| Find the beach on Google (Text Search, IDs only) | Unlimited | Unlimited, and each result is kept, as Google permits |
+| Rating, review count, photo list (Place Details Enterprise) | 1,000 a month | 900 a month, 40 a day per connection |
+| Each photo image (Place Details Photos) | 1,000 a month | 900 a month, 40 a day per connection |
 
-Google's display rules are handled: the Google logo appears next to any Google photo, and each photo shows its author.
+Months follow Google's billing clock, US Pacific time. Past those limits, Google charges $20 per 1,000 rating lookups and $7 per 1,000 photos. The function stops well before that point.
+
+Setup:
+
+1. In Google Cloud Console, create a project, attach billing, enable **Places API (New)**, and create an API key. Under **API restrictions**, allow only Places API (New). Leave application restrictions off, because the calls come from Supabase's servers.
+2. In Supabase, open **Edge Functions > Deploy a new function > Via Editor**. Name it `google-place`, paste all of [`supabase/functions/google-place/index.ts`](supabase/functions/google-place/index.ts), and deploy.
+3. In the function's settings, turn **off** JWT verification ("Verify JWT"). The site sends the publishable key, which is not a JWT. The function checks the calling site instead, and the database limits above apply whoever calls.
+4. Under **Edge Functions > Secrets**, add `GOOGLE_MAPS_API_KEY` with your key. Supabase supplies the project URL and service key to the function itself.
+5. In [`config.js`](config.js), set `useGoogle: true`, commit, push.
+
+Google's display rules are handled: the "Powered by Google" logo appears next to Google ratings and photos, each photo credits its author, and nothing Google returns is stored except place IDs. If you use the site from another address, add it to the function's optional `ALLOWED_ORIGINS` secret, comma separated.
+
+## Flickr photos (optional)
+
+Flickr only issues API keys to Flickr Pro accounts. With one, put the key in `config.js` as `flickrApiKey` and Flickr replaces the Wikimedia Commons part of the photos.
 
 ## When it feels slow
 
-The page loads in well under a second. What can take long is the Overpass service that answers beach queries: it is a shared public service and sometimes replies "busy" or hangs. Hello Beaches asks several mirrors, re-asks a busy one after two seconds, skips one that timed out, and keeps a 24-hour cache of searches, so repeat visits are instant.
+The page loads in well under a second. What can take long is the Overpass service that answers beach queries, a shared public service that sometimes replies "busy" or hangs. Hello Beaches asks several mirrors, re-asks a busy one after two seconds, skips one that timed out, and keeps a 24-hour cache, so repeat visits are instant.
 
 ## Run locally
 
@@ -49,4 +67,4 @@ Then open http://localhost:8765. Location sharing needs HTTPS or localhost.
 
 ## Credits
 
-Beach data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, ODbL. Map tiles by OpenStreetMap. Missing a beach? Add it on OSM and it shows up here.
+Beach data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, ODbL. Map © [OpenMapTiles](https://www.openmaptiles.org/) via [OpenFreeMap](https://openfreemap.org). Photos from Wikimedia Commons and Wikipedia, credited on each file page. Missing a beach? Add it on OpenStreetMap and it shows up here.

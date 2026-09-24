@@ -4,73 +4,97 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Hello Beaches</title>
-  <meta name="description" content="Hello Beaches finds the beaches nearest to you, sorted by distance, with photos and directions.">
-  <meta name="theme-color" content="#0E8C86">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230E8C86'/%3E%3Cpath d='M4 20c4-3 8-3 12 0s8 3 12 0v8H4z' fill='%23E3B96B'/%3E%3Ccircle cx='22' cy='10' r='4' fill='%23F2F7F5'/%3E%3C/svg%3E">
+  <meta name="description" content="Hello Beaches finds the beaches nearest to you, closest first, with photos, ratings and directions.">
+  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%2335b6ff'/%3E%3Cstop offset='1' stop-color='%230071e3'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3Cpath d='M6 15.5a10 9 0 0 1 20 0Z' fill='%23fff'/%3E%3Cpath d='M16 15.5v7a2.3 2.3 0 0 1-4.6 0' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Instrument+Sans:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" crossorigin="">
-  <link rel="stylesheet" href="style.css?v=6">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.css" crossorigin="">
+  <link rel="stylesheet" href="style.css?v=7">
 </head>
 <body>
-  <main class="app">
-    <aside class="panel">
-      <header class="brand">
-        <h1 class="wordmark"><span class="wordmark-hello">Hello</span> Beaches</h1>
-        <p class="tagline">Nearest sand, sorted by distance.</p>
-      </header>
+  <header class="globalnav">
+    <a class="brand" href="./">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <defs><linearGradient id="brand-g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#35b6ff"/><stop offset="1" stop-color="#0071e3"/></linearGradient></defs>
+        <rect width="32" height="32" rx="8" fill="url(#brand-g)"/>
+        <path d="M6 15.5a10 9 0 0 1 20 0Z" fill="#fff"/>
+        <path d="M16 15.5v7a2.3 2.3 0 0 1-4.6 0" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+      </svg>
+      <span>Hello Beaches</span>
+    </a>
+  </header>
 
-      <section class="controls" aria-label="Where to search">
-        <button id="locate-btn" class="btn btn-primary" type="button">
-          <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3" fill="currentColor"/><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 0v4M10 16v4M0 10h4M16 10h4" stroke="currentColor" stroke-width="1.8"/></svg>
+  <main class="app">
+    <section class="panel" aria-label="Find beaches">
+      <div class="hero">
+        <h1 class="headline">Find your beach.</h1>
+        <p class="subhead">Every beach around you, closest first. With photos, ratings and directions.</p>
+      </div>
+
+      <div class="controls">
+        <button id="locate-btn" class="button button-primary button-wide" type="button">
+          <svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M17.6 2.4 2.9 8.6c-.7.3-.6 1.3.1 1.5l5.6 1.3 1.3 5.6c.2.7 1.2.8 1.5.1l6.2-14.7Z" fill="currentColor"/></svg>
           Use my location
         </button>
 
-        <form id="search-form" class="search" autocomplete="off">
-          <label for="place-input" class="visually-hidden">Search a place</label>
-          <input id="place-input" name="place" type="search" placeholder="Search a place, e.g. Bodrum" enterkeyhint="search" spellcheck="false">
-          <button class="btn" type="submit">Go</button>
+        <form id="search-form" class="search" role="search" autocomplete="off">
+          <label for="place-input" class="visually-hidden">Search a town or place</label>
+          <div class="search-field">
+            <svg class="search-icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.75" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m13 13 4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            <input id="place-input" name="place" type="search" placeholder="Search a town or place" enterkeyhint="search" spellcheck="false">
+          </div>
+          <button class="button button-secondary" type="submit">Search</button>
         </form>
 
-        <div class="radius-row">
-          <label for="radius-select">Within</label>
-          <select id="radius-select">
-            <option value="5">5 km</option>
-            <option value="10">10 km</option>
-            <option value="25" selected>25 km</option>
-            <option value="50">50 km</option>
-            <option value="100">100 km</option>
-          </select>
-          <span class="hint">or tap anywhere on the map</span>
-        </div>
-      </section>
+        <fieldset class="segmented" id="radius-group">
+          <legend class="visually-hidden">Search radius</legend>
+          <span class="segmented-label" aria-hidden="true">Within</span>
+          <div class="segmented-track">
+            <input type="radio" name="radius" id="radius-5" value="5"><label for="radius-5">5 km</label>
+            <input type="radio" name="radius" id="radius-10" value="10"><label for="radius-10">10 km</label>
+            <input type="radio" name="radius" id="radius-25" value="25" checked><label for="radius-25">25 km</label>
+            <input type="radio" name="radius" id="radius-50" value="50"><label for="radius-50">50 km</label>
+            <input type="radio" name="radius" id="radius-100" value="100"><label for="radius-100">100 km</label>
+          </div>
+        </fieldset>
+        <p class="hint">Or tap anywhere on the map.</p>
+      </div>
 
       <div id="status" class="status" role="status" aria-live="polite"></div>
 
       <div id="empty" class="empty">
-        <p>Try a place to see how it works:</p>
+        <p class="empty-title">Try one of these</p>
         <div class="try-row" id="try-row">
-          <button type="button" class="chip chip-btn" data-place="Bodrum">Bodrum</button>
-          <button type="button" class="chip chip-btn" data-place="Antalya">Antalya</button>
-          <button type="button" class="chip chip-btn" data-place="Lisbon">Lisbon</button>
-          <button type="button" class="chip chip-btn" data-place="Sydney">Sydney</button>
+          <button type="button" class="pill" data-place="Bodrum">Bodrum</button>
+          <button type="button" class="pill" data-place="Antalya">Antalya</button>
+          <button type="button" class="pill" data-place="Lisbon">Lisbon</button>
+          <button type="button" class="pill" data-place="Sydney">Sydney</button>
         </div>
       </div>
 
       <ol id="results" class="results" aria-label="Beaches near you"></ol>
 
-      <footer class="credits">
-        Beach data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors.
-        Missing a beach? <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">Add it on OSM</a>.
+      <footer class="footnote">
+        <p>Beach data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors. Map © <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> via <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a>. Photos from Wikimedia Commons and Wikipedia.</p>
+        <p>Missing a beach? <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">Add it on OpenStreetMap</a> and it shows up here.</p>
       </footer>
-    </aside>
+    </section>
 
-    <div id="map" class="map" role="region" aria-label="Map of nearby beaches"></div>
+    <div class="map-wrap">
+      <div id="map" class="map" role="region" aria-label="Map of nearby beaches"></div>
+    </div>
   </main>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" crossorigin=""></script>
-  <script src="config.js?v=6"></script>
-  <script src="app.js?v=6"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.js" crossorigin=""></script>
+  <script src="https://cdn.jsdelivr.net/npm/@maplibre/maplibre-gl-leaflet@0.1.4/leaflet-maplibre-gl.js" crossorigin=""></script>
+  <script src="config.js?v=7"></script>
+  <script src="backend.js?v=7"></script>
+  <script src="ratings.js?v=7"></script>
+  <script src="app.js?v=7"></script>
 </body>
 </html>

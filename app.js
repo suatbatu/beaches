@@ -1,15 +1,17 @@
 /* Hello Beaches — nearby beach finder.
-   Data: OpenStreetMap via Overpass (natural=beach). Geocoding: Nominatim. Map: Leaflet.
-   Photos: Flickr when a key is set in config.js, otherwise Wikimedia Commons. */
+   Data: OpenStreetMap via Overpass (natural=beach). Geocoding: Nominatim. Map: Leaflet, drawing OpenFreeMap vector styles through MapLibre.
+   Photos: OpenStreetMap links, Wikipedia, Wikimedia Commons (or Flickr), and Google as a last resort.
+   Ratings: ratings.js. Google data only ever comes through the site's own Supabase function. */
 (function () {
   'use strict';
 
   const CONFIG = window.HELLO_BEACHES_CONFIG || {};
+  const BACKEND = window.HelloBeachesBackend || { enabled: false };
+  const RATINGS = window.HelloBeachesRatings || null;
   const FLICKR_API_KEY = String(CONFIG.flickrApiKey || '').trim();
-  const GOOGLE_KEY = String(CONFIG.googleMapsApiKey || '').trim();
   const clampInt = (v, lo, hi, dflt) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
-  const GOOGLE_PHOTO_LIMIT = clampInt(CONFIG.googlePhotoLimit, 1, 5, 2);
-  const GOOGLE_DAILY_BUDGET = clampInt(CONFIG.googleDailyBudget, 1, 500, 20);
+  const GOOGLE_ON = CONFIG.useGoogle === true && !!BACKEND.enabled;
+  const GOOGLE_PHOTO_LIMIT = clampInt(CONFIG.googlePhotoLimit, 1, 3, 2);
 
   const OVERPASS_MIRRORS = [
     'https://overpass-api.de/api/interpreter',
@@ -30,7 +32,6 @@
   const STORAGE_KEY = 'beaches:last';
   const MIRROR_KEY = 'beaches:mirror';
   const CACHE_KEY = 'beaches:cache:v2';
-  const OLD_CACHE_KEYS = ['beaches:cache'];
   const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
   const CACHE_MAX = 6;
   const COMMONS = 'https://commons.wikimedia.org/w/api.php';
@@ -41,17 +42,14 @@
   const COMMONS_LIMIT = 30;
   const WIKI_RADIUS_M = 1000;
   const PHOTO_MAX = 10;
-  const PLACES = 'https://places.googleapis.com/v1';
-  const GOOGLE_CACHE_KEY = 'beaches:google:v1';
-  const GOOGLE_BUDGET_KEY = 'beaches:google:budget';
-  const GOOGLE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;   // Google allows caching place data for 30 days
-  const GOOGLE_CACHE_MAX = 200;
+  const OLD_STORAGE_KEYS = ['beaches:cache', 'beaches:google:v1', 'beaches:google:budget'];
 
   const els = {
     locateBtn: document.getElementById('locate-btn'),
     form: document.getElementById('search-form'),
     input: document.getElementById('place-input'),
-    radius: document.getElementById('radius-select'),
+    radiusGroup: document.getElementById('radius-group'),
+    radiusInputs: Array.from(document.querySelectorAll('input[name="radius"]')),
     status: document.getElementById('status'),
     empty: document.getElementById('empty'),
     tryRow: document.getElementById('try-row'),
@@ -75,10 +73,47 @@
   /* ---------- Map ---------- */
 
   const map = L.map('map', { zoomControl: true, worldCopyJump: true }).setView([38.5, 20], 4);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
-  }).addTo(map);
+  // Basemap: OpenFreeMap vector styles (free, no key, no view limits) drawn by MapLibre inside Leaflet.
+  // Without WebGL, or if MapLibre fails to load, plain OpenStreetMap raster tiles take over.
+  const STYLES = {
+    light: 'https://tiles.openfreemap.org/styles/positron',
+    dark: 'https://tiles.openfreemap.org/styles/dark',
+  };
+  const VECTOR_ATTRIBUTION = '<a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> ' +
+    '&copy; <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> ' +
+    'Data from <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+  const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
+  const isDark = () => { const t = document.documentElement.getAttribute('data-theme'); return t ? t === 'dark' : darkMq.matches; };
+
+  function webglAvailable() {
+    try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); }
+    catch (e) { return false; }
+  }
+
+  let vectorBase = null;
+  function addRasterBase() {
+    document.getElementById('map').classList.add('raster-base');
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+    }).addTo(map);
+  }
+  if (window.maplibregl && typeof L.maplibreGL === 'function' && webglAvailable()) {
+    try {
+      vectorBase = L.maplibreGL({ style: isDark() ? STYLES.dark : STYLES.light, attributionControl: { customAttribution: VECTOR_ATTRIBUTION } }).addTo(map);
+    } catch (err) {
+      console.warn('Vector map unavailable, using raster tiles:', err && err.message);
+      vectorBase = null;
+      addRasterBase();
+    }
+  } else {
+    addRasterBase();
+  }
+
+  const mapEl = document.getElementById('map');
+  const syncZoomClass = () => mapEl.classList.toggle('zoomed-out', map.getZoom() < 12);
+  map.on('zoomend', syncZoomClass);
+  syncZoomClass();
 
   const markersLayer = L.layerGroup().addTo(map);
   const markersById = new Map();
@@ -86,15 +121,17 @@
   let radiusCircle = null;
 
   function accentColor() {
-    return getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#0E8C86';
+    return getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#0071e3';
   }
+
+  const UMBRELLA_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 11.4a8.5 7.9 0 0 1 17 0Z" fill="#fff"/><path d="M12 11.4v6.1a1.9 1.9 0 0 1-3.8 0" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/></svg>';
 
   function beachIcon(selected) {
     return L.divIcon({
       className: 'beach-pin',
-      html: '<div class="beach-marker' + (selected ? ' is-selected' : '') + '"></div>',
-      iconSize: [16, 16],
-      iconAnchor: [8, 8],
+      html: '<div class="beach-marker' + (selected ? ' is-selected' : '') + '">' + UMBRELLA_SVG + '</div>',
+      iconSize: [34, 34],
+      iconAnchor: [17, 17],
     });
   }
 
@@ -191,7 +228,7 @@
     if (action) {
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = 'btn btn-small';
+      b.className = 'button button-secondary button-small';
       b.textContent = action.label;
       b.addEventListener('click', action.onClick);
       els.status.appendChild(b);
@@ -487,6 +524,7 @@
       renderResults();
       renderMarkers();
       fitToResults();
+      loadListRatings(seq);
 
       const n = beaches.length;
       if (n === 0) {
@@ -532,16 +570,20 @@
     const ll = [state.center.lat, state.center.lon];
     const r = state.radiusKm * 1000;
     if (!radiusCircle) {
-      radiusCircle = L.circle(ll, { radius: r, color: accentColor(), weight: 1.2, dashArray: '4 6', fillOpacity: 0.05, interactive: false }).addTo(map);
+      radiusCircle = L.circle(ll, { radius: r, color: accentColor(), weight: 1.5, dashArray: '2 6', fillOpacity: 0.06, interactive: false }).addTo(map);
     } else {
       radiusCircle.setLatLng(ll);
       radiusCircle.setRadius(r);
     }
   }
 
+  function setRadiusControl(km) {
+    for (const input of els.radiusInputs) input.checked = input.value === String(km);
+  }
+
   function setRadius(km) {
     state.radiusKm = km;
-    els.radius.value = String(km);
+    setRadiusControl(km);
     updateCircle();
     if (state.center) {
       saveStored();
@@ -551,57 +593,107 @@
 
   /* ---------- Rendering ---------- */
 
+  const CHEVRON_SVG = '<svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.2 1.8 8.4 6l-4.2 4.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
   function renderResults() {
-    const list = state.beaches.slice(0, MAX_LIST);
     const frag = document.createDocumentFragment();
-    for (const b of list) {
+    state.beaches.slice(0, MAX_LIST).forEach((b, i) => {
       const li = document.createElement('li');
-      li.className = 'result' + (b.id === state.selectedId ? ' is-selected' : '');
+      li.className = 'result';
       li.dataset.id = b.id;
-      li.tabIndex = 0;
-      li.setAttribute('role', 'button');
-      li.setAttribute('aria-label', (b.name || 'Unnamed beach') + ', ' + formatDistance(b.distanceKm) + ' ' + compassLabel(b.bearing));
       const deg = Math.round(b.bearing);
-      const igTag = b.name ? instagramTag(b.name) : null;
-      const wikiRef = parseWikipediaTag(b.wikipedia);
+      const detailId = 'beach-detail-' + i;
       li.innerHTML =
-        '<div class="result-main">' +
-          '<h3 class="result-name' + (b.name ? '' : ' is-unnamed') + '">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</h3>' +
-          (b.features.length
-            ? '<div class="result-tags">' + b.features.map((f) => '<span class="chip ' + f.cls + '">' + esc(f.label) + '</span>').join('') + '</div>'
-            : '') +
-        '</div>' +
-        '<div class="result-dist">' +
-          '<span class="dist-value">' + formatDistance(b.distanceKm) + '</span>' +
-          '<span class="bearing" title="Bearing ' + deg + '°">' +
-            '<svg viewBox="0 0 16 16" aria-hidden="true" style="rotate:' + deg + 'deg"><path d="M8 1.5 12.5 12.5 8 10 3.5 12.5Z"/></svg>' +
-            compassLabel(b.bearing) +
+        '<button type="button" class="result-head" aria-expanded="false" aria-controls="' + detailId + '">' +
+          '<span class="result-main">' +
+            '<span class="result-name' + (b.name ? '' : ' is-unnamed') + '">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</span>' +
+            '<span class="result-sub">' +
+              b.features.map((f) => '<span class="tag' + (f.cls === 'chip-warn' ? ' tag-warn' : '') + '">' + esc(f.label) + '</span>').join('') +
+            '</span>' +
           '</span>' +
-        '</div>' +
-        '<div class="result-actions">' +
-          '<a class="link-dir" href="' + directionsUrl(b) + '" target="_blank" rel="noopener">Directions</a>' +
-          '<a class="link-osm" href="https://www.openstreetmap.org/' + b.osmType + '/' + b.osmId + '" target="_blank" rel="noopener">View on OSM</a>' +
-          (wikiRef ? '<a class="link-osm" href="' + esc(wikipediaUrl(wikiRef)) + '" target="_blank" rel="noopener">Wikipedia</a>' : '') +
-          (igTag ? '<a class="link-osm" href="https://www.instagram.com/explore/tags/' + igTag + '/" target="_blank" rel="noopener">Instagram</a>' : '') +
-        '</div>';
+          '<span class="result-dist">' +
+            '<span class="dist-value">' + formatDistance(b.distanceKm) + '</span>' +
+            '<span class="bearing" title="Bearing ' + deg + '°">' +
+              '<svg viewBox="0 0 16 16" aria-hidden="true" style="rotate:' + deg + 'deg"><path d="M8 1.5 12.5 12.5 8 10 3.5 12.5Z"/></svg>' +
+              compassLabel(b.bearing) +
+            '</span>' +
+          '</span>' +
+          CHEVRON_SVG +
+        '</button>' +
+        '<div class="result-detail" id="' + detailId + '" hidden></div>';
       frag.appendChild(li);
-    }
+    });
     els.results.replaceChildren(frag);
+  }
+
+  /* ----- Ratings in the list ----- */
+
+  const plural = (n, one, many) => n.toLocaleString('en') + ' ' + (n === 1 ? one : many);
+
+  function rowRatingHtml(summary, mine) {
+    const star = '<span class="star" aria-hidden="true">★</span>';
+    if (summary) {
+      return '<span class="rating-inline">' + star + '<span class="visually-hidden">Rated </span>' + summary.avg.toFixed(1) +
+        '<span class="visually-hidden"> out of 5,</span> <span class="votes">(' + summary.votes.toLocaleString('en') + ')</span></span>';
+    }
+    if (mine) {
+      return '<span class="rating-inline">' + star + '<span class="visually-hidden">You rated it </span>' + mine + ' <span class="votes" aria-hidden="true">(you)</span></span>';
+    }
+    return '';
+  }
+
+  function paintRowRating(li) {
+    const sub = li && li.querySelector('.result-sub');
+    if (!sub) return;
+    const old = sub.querySelector('.rating-inline');
+    if (old) old.remove();
+    const id = li.dataset.id;
+    const html = rowRatingHtml(RATINGS ? RATINGS.cached(id) : null, RATINGS ? RATINGS.mine(id) : null);
+    if (html) sub.insertAdjacentHTML('afterbegin', html);
+  }
+
+  async function loadListRatings(seq) {
+    if (!RATINGS) return;
+    if (RATINGS.shared) {
+      try { await RATINGS.summaries(state.beaches.slice(0, MAX_LIST).map((b) => b.id)); }
+      catch (err) { console.warn('Ratings could not be loaded:', err && err.message); }
+    }
+    if (seq !== state.searchSeq) return;
+    for (const li of els.results.children) paintRowRating(li);
+  }
+
+  /* ----- Map popup ----- */
+
+  const popupPhotoById = new Map();   // beach id -> the photo shown in its popup
+
+  function popupRatingLine(b) {
+    const s = RATINGS ? RATINGS.cached(b.id) : null;
+    if (s) return '<div class="popup-rating"><span class="star">★</span> ' + s.avg.toFixed(1) + ' · ' + plural(s.votes, 'rating', 'ratings') + '</div>';
+    const g = googleInfoCache.get(b.id);
+    if (g && typeof g.rating === 'number') return '<div class="popup-rating"><span class="star">★</span> ' + g.rating.toFixed(1) + ' on Google Maps</div>';
+    return '';
   }
 
   function popupHtml(b, photo) {
     return '<div class="popup">' +
       (photo
-        ? '<a class="popup-photo" href="' + esc(photo.page) + '" target="_blank" rel="noopener">' +
-            '<img src="' + esc(photo.thumb) + '" alt="' + esc(photo.title) + '"></a>' +
+        ? '<a class="popup-photo" href="' + esc(photo.page) + '" target="_blank" rel="noopener"><img src="' + esc(photo.thumb) + '" alt="' + esc(photo.title) + '"></a>' +
           (photo.kind === 'google'
-            ? '<div class="popup-google">' + (photo.artist ? '<span class="popup-author">Photo: ' + esc(photo.artist) + '</span>' : '') + GOOGLE_LOGO_HTML + '</div>'
+            ? '<div class="popup-credit"><span>' + (photo.artist ? 'Photo: ' + esc(photo.artist) : 'Google Maps photo') + '</span>' + GOOGLE_ATTR_HTML + '</div>'
             : '')
         : '') +
-      '<div class="popup-name">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</div>' +
-      '<div class="popup-dist">' + formatDistance(b.distanceKm) + ' ' + compassLabel(b.bearing) + ' of ' + esc(describeWhere()) + '</div>' +
-      '<a class="link-dir" href="' + directionsUrl(b) + '" target="_blank" rel="noopener">Directions</a>' +
+      '<div class="popup-body">' +
+        '<div class="popup-name">' + (b.name ? esc(b.name) : 'Unnamed beach') + '</div>' +
+        '<div class="popup-dist">' + formatDistance(b.distanceKm) + ' ' + compassLabel(b.bearing) + ' of ' + esc(describeWhere()) + '</div>' +
+        popupRatingLine(b) +
+        '<a class="button button-primary button-small" href="' + directionsUrl(b) + '" target="_blank" rel="noopener">Directions</a>' +
+      '</div>' +
     '</div>';
+  }
+
+  function refreshPopup(b) {
+    const m = markersById.get(b.id);
+    if (m) m.setPopupContent(popupHtml(b, popupPhotoById.get(b.id) || null));
   }
 
   function renderMarkers() {
@@ -609,7 +701,7 @@
     markersById.clear();
     for (const b of state.beaches.slice(0, MAX_MARKERS)) {
       const m = L.marker([b.lat, b.lon], { icon: beachIcon(false), title: b.name || 'Unnamed beach', riseOnHover: true, keyboard: false });
-      m.bindPopup(popupHtml(b), { closeButton: false, offset: [0, -6], minWidth: 200, maxWidth: 260 });
+      m.bindPopup(popupHtml(b, popupPhotoById.get(b.id) || null), { closeButton: false, offset: [0, -12], minWidth: 220, maxWidth: 260 });
       m.on('click', () => select(b.id, 'map'));
       m.addTo(markersLayer);
       markersById.set(b.id, m);
@@ -627,9 +719,42 @@
     map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 14, animate: !reducedMotion });
   }
 
+  /* ----- Selecting a beach ----- */
+
+  function openDetail(b, li) {
+    li.classList.add('is-selected');
+    const head = li.querySelector('.result-head');
+    const detail = li.querySelector('.result-detail');
+    if (!head || !detail) return;
+    head.setAttribute('aria-expanded', 'true');
+    detail.innerHTML = detailHtml(b);
+    detail.hidden = false;
+    showPhotos(b, detail);
+    showRatings(b, detail);
+  }
+
+  function closeDetail(li) {
+    li.classList.remove('is-selected');
+    const head = li.querySelector('.result-head');
+    const detail = li.querySelector('.result-detail');
+    if (head) head.setAttribute('aria-expanded', 'false');
+    if (detail) { detail.hidden = true; detail.replaceChildren(); }
+  }
+
+  function deselect() {
+    const id = state.selectedId;
+    if (!id) return;
+    state.selectedId = null;
+    const m = markersById.get(id);
+    if (m) { m.setIcon(beachIcon(false)); m.setZIndexOffset(0); m.closePopup(); }
+    const li = els.results.querySelector('[data-id="' + CSS.escape(id) + '"]');
+    if (li) closeDetail(li);
+  }
+
   function select(id, source) {
     const b = state.beaches.find((x) => x.id === id);
     if (!b) return;
+    if (source === 'list' && state.selectedId === id) { deselect(); return; }
     const prev = state.selectedId;
     state.selectedId = id;
 
@@ -644,14 +769,10 @@
       m.setZIndexOffset(1000);
     }
 
-    let selectedLi = null;
     for (const li of els.results.children) {
-      const on = li.dataset.id === id;
-      li.classList.toggle('is-selected', on);
-      if (on) selectedLi = li;
-      else { const box = li.querySelector('.result-photos'); if (box) box.remove(); }
+      if (li.dataset.id === id) { if (!li.classList.contains('is-selected')) openDetail(b, li); }
+      else if (li.classList.contains('is-selected')) closeDetail(li);
     }
-    if (selectedLi) showPhotos(b, selectedLi);
 
     if (source === 'map') {
       const li = els.results.querySelector('[data-id="' + CSS.escape(id) + '"]');
@@ -673,6 +794,122 @@
         setTimeout(openOnce, 1500);
       }
     }
+  }
+
+  function detailHtml(b) {
+    const wikiRef = parseWikipediaTag(b.wikipedia);
+    const igTag = b.name ? instagramTag(b.name) : null;
+    const labelId = 'rate-label-' + b.id.replace(/\W/g, '-');
+    let starButtons = '';
+    for (let n = 1; n <= 5; n++) {
+      starButtons += '<button type="button" data-stars="' + n + '" aria-label="Rate ' + n + (n === 1 ? ' star' : ' stars') + '" aria-pressed="false">★</button>';
+    }
+    return '<div class="gallery" aria-label="Photos of this beach">' + '<div class="skeleton"></div>'.repeat(3) + '</div>' +
+      '<p class="gallery-note" hidden></p>' +
+      '<div class="ratings">' +
+        '<div class="rating-summary" hidden></div>' +
+        '<div class="rating-google" hidden></div>' +
+        '<div class="rate">' +
+          '<span class="rate-label" id="' + labelId + '">Rate this beach</span>' +
+          '<div class="rate-stars" role="group" aria-labelledby="' + labelId + '">' + starButtons + '</div>' +
+          '<p class="rate-note" aria-live="polite"></p>' +
+        '</div>' +
+      '</div>' +
+      '<div class="actions">' +
+        '<a class="button button-primary button-small" href="' + directionsUrl(b) + '" target="_blank" rel="noopener">Directions</a>' +
+        '<a class="link-more" href="https://www.openstreetmap.org/' + b.osmType + '/' + b.osmId + '" target="_blank" rel="noopener">OpenStreetMap</a>' +
+        (wikiRef ? '<a class="link-more" href="' + esc(wikipediaUrl(wikiRef)) + '" target="_blank" rel="noopener">Wikipedia</a>' : '') +
+        (igTag ? '<a class="link-more" href="https://www.instagram.com/explore/tags/' + igTag + '/" target="_blank" rel="noopener">Instagram</a>' : '') +
+      '</div>';
+  }
+
+  /* ----- Ratings in the detail card ----- */
+
+  function starsHtml(value) {
+    const pct = Math.max(0, Math.min(100, (value / 5) * 100)).toFixed(1);
+    return '<span class="stars" style="--pct:' + pct + '%" aria-hidden="true">★★★★★</span>';
+  }
+
+  function paintSummary(el, s) {
+    if (!el) return;
+    el.innerHTML = s
+      ? '<div class="rating-big">' + s.avg.toFixed(1) + '<span class="visually-hidden"> out of 5</span></div>' +
+        '<div class="rating-meta">' + starsHtml(s.avg) + '<span class="rating-count">' + plural(s.votes, 'rating', 'ratings') + ' on Hello Beaches</span></div>'
+      : '<p class="rating-empty">No ratings yet. Be the first.</p>';
+    el.hidden = false;
+  }
+
+  function paintGoogle(el, info) {
+    if (!el) return;
+    const url = info.mapsUri || ('https://www.google.com/maps/place/?q=place_id:' + encodeURIComponent(info.id));
+    el.innerHTML = '<strong>' + info.rating.toFixed(1) + '<span class="visually-hidden"> out of 5</span></strong>' + starsHtml(info.rating) +
+      '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + plural(info.ratingCount || 0, 'review', 'reviews') + ' on Google Maps</a>' +
+      GOOGLE_ATTR_HTML;
+    el.hidden = false;
+  }
+
+  function paintMine(detail, stars) {
+    for (const btn of detail.querySelectorAll('.rate-stars button')) {
+      const n = Number(btn.dataset.stars);
+      btn.classList.toggle('is-on', !!stars && n <= stars);
+      btn.setAttribute('aria-pressed', String(!!stars && n === stars));
+    }
+  }
+
+  function setRateNote(detail, text, isError) {
+    const note = detail.querySelector('.rate-note');
+    if (!note) return;
+    note.textContent = text;
+    note.classList.toggle('is-error', !!isError);
+  }
+
+  async function showRatings(b, detail) {
+    const shared = !!(RATINGS && RATINGS.shared);
+    const mine = RATINGS ? RATINGS.mine(b.id) : null;
+    paintMine(detail, mine);
+    setRateNote(detail, mine
+      ? 'Your rating: ' + mine + ' of 5' + (shared ? '. Tap a star to change it.' : ', saved on this device.')
+      : (shared ? 'Tap a star. Everyone sees the average.' : 'Your ratings are saved on this device.'));
+
+    const alive = () => state.selectedId === b.id && detail.isConnected;
+    const jobs = [];
+    if (shared) {
+      jobs.push(RATINGS.summaries([b.id])
+        .then((m) => { if (alive()) paintSummary(detail.querySelector('.rating-summary'), m.get(b.id) || null); })
+        .catch((err) => console.warn('Ratings could not be loaded:', err && err.message)));
+    }
+    if (GOOGLE_ON) {
+      jobs.push(googleInfo(b).then((info) => {
+        if (alive() && info && typeof info.rating === 'number') paintGoogle(detail.querySelector('.rating-google'), info);
+      }));
+    }
+    await Promise.all(jobs);
+    if (alive()) refreshPopup(b);
+  }
+
+  async function submitRating(li, stars) {
+    if (!RATINGS || !li) return;
+    const id = li.dataset.id;
+    const detail = li.querySelector('.result-detail');
+    if (!detail) return;
+    paintMine(detail, stars);
+    setRateNote(detail, RATINGS.shared ? 'Saving…' : 'Your rating: ' + stars + ' of 5, saved on this device.');
+    try {
+      const res = await RATINGS.rate(id, stars);
+      if (res.shared && detail.isConnected) {
+        setRateNote(detail, 'Thanks. Your ' + stars + '-star rating is shared.');
+        paintSummary(detail.querySelector('.rating-summary'), res.summary);
+      }
+    } catch (err) {
+      console.warn('Rating could not be shared:', err && err.message);
+      const msg = String((err && err.message) || '');
+      if (detail.isConnected) {
+        setRateNote(detail, /Too many ratings/.test(msg) ? msg : 'Saved on this device. It couldn’t be shared right now; try again later.', true);
+      }
+    }
+    paintRowRating(li);
+    const b = state.beaches.find((x) => x.id === id);
+    if (b) refreshPopup(b);
   }
 
   /* ---------- Photos ----------
@@ -865,98 +1102,53 @@
       .sort((a, c) => c.score - a.score || a.index - c.index);
   }
 
-  /* Google Maps photos, only as a fallback when the free sources have nothing that looks like the beach.
-     Cost control, in three layers:
-       1. Text Search and Place Details are asked with "IDs only" field masks, which Google prices as
-          unlimited free. The only metered call is each photo image (Place Details Photos SKU).
-       2. At most GOOGLE_PHOTO_LIMIT photos per beach, GOOGLE_DAILY_BUDGET photo loads per browser per day,
-          and a 30-day cache of place lookups, so a beach is never looked up twice.
-       3. The hard guarantee lives in Google Cloud Console: a daily quota cap on the API (see README). */
+  /* Google Maps, through the site's own Supabase Edge Function (supabase/functions/google-place).
+     The browser never holds the Google key. The function books every metered Google call in the
+     database first and refuses once the month's free allowance is nearly used, so Google cannot bill. */
 
-  function readGoogleCache() {
-    try { const raw = localStorage.getItem(GOOGLE_CACHE_KEY); const obj = raw ? JSON.parse(raw) : {}; return obj && typeof obj === 'object' ? obj : {}; }
-    catch (e) { return {}; }
-  }
-  function googleCacheGet(id) {
-    const e = readGoogleCache()[id];
-    return e && Date.now() - e.at < GOOGLE_CACHE_TTL_MS ? e : null;
-  }
-  function googleCachePut(id, entry) {
-    const all = readGoogleCache();
-    const now = Date.now();
-    const keys = Object.keys(all).filter((k) => now - all[k].at < GOOGLE_CACHE_TTL_MS).sort((a, c) => all[c].at - all[a].at);
-    const next = {};
-    for (const k of keys.slice(0, GOOGLE_CACHE_MAX - 1)) next[k] = all[k];
-    next[id] = entry;
-    try { localStorage.setItem(GOOGLE_CACHE_KEY, JSON.stringify(next)); } catch (e) { /* ignore */ }
-  }
-  // Returns how many of `wanted` photo loads this browser may still make today, and books them.
-  function googleBudgetTake(wanted) {
-    const day = new Date().toISOString().slice(0, 10);
-    let rec = { day, used: 0 };
-    try { const raw = localStorage.getItem(GOOGLE_BUDGET_KEY); const r = raw ? JSON.parse(raw) : null; if (r && r.day === day && typeof r.used === 'number') rec = r; } catch (e) { /* ignore */ }
-    const allowed = Math.max(0, Math.min(wanted, GOOGLE_DAILY_BUDGET - rec.used));
-    if (allowed > 0) {
-      rec.used += allowed;
-      try { localStorage.setItem(GOOGLE_BUDGET_KEY, JSON.stringify(rec)); } catch (e) { /* ignore */ }
-    }
-    return allowed;
-  }
+  const googleInfoById = new Map();    // beach id -> Promise<info or null>
+  const googleInfoCache = new Map();   // beach id -> info, once it has arrived (read by the popup)
+  // Google requires its logo next to Places content shown away from a Google map.
+  const GOOGLE_ATTR_HTML = '<picture class="google-attr">' +
+    '<source media="(prefers-color-scheme: dark)" srcset="https://maps.gstatic.com/mapfiles/api-3/images/powered-by-google-on-non-white3_hdpi.png">' +
+    '<img src="https://maps.gstatic.com/mapfiles/api-3/images/powered-by-google-on-white3_hdpi.png" alt="Powered by Google" width="120" height="14">' +
+    '</picture>';
 
-  async function googleCall(path, mask, body) {
-    const headers = { 'X-Goog-Api-Key': GOOGLE_KEY, 'X-Goog-FieldMask': mask };
-    const init = { headers };
-    if (body) { init.method = 'POST'; headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
-    const res = await fetchWithTimeout(PLACES + path, init, 15000, null);
-    if (!res.ok) throw new Error('Google Places HTTP ' + res.status);
-    return res.json();
-  }
-
-  // Find the beach's Google place (free, IDs only) and remember its photo names.
-  async function googleLookup(b) {
-    const d = b.name ? 0.01 : 0.003;   // about 1 km for a named beach, 300 m for an unnamed strip
-    const search = await googleCall('/places:searchText', 'places.id', {
-      textQuery: b.name || 'beach',
-      includedType: 'beach',
-      maxResultCount: 1,
-      locationRestriction: { rectangle: {
-        low: { latitude: b.lat - d, longitude: b.lon - d },
-        high: { latitude: b.lat + d, longitude: b.lon + d },
-      } },
-    });
-    const placeId = search && Array.isArray(search.places) && search.places[0] ? search.places[0].id : null;
-    if (!placeId) return { placeId: null, photos: [], at: Date.now() };
-    const details = await googleCall('/places/' + encodeURIComponent(placeId), 'id,photos');
-    const photos = (details && Array.isArray(details.photos) ? details.photos : []).slice(0, 10)
-      .filter((ph) => ph && typeof ph.name === 'string')
-      .map((ph) => {
-        const a = ph.authorAttributions && ph.authorAttributions[0] ? ph.authorAttributions[0] : {};
-        return {
-          name: ph.name,
-          author: String(a.displayName || ''),
-          authorUri: typeof a.uri === 'string' ? a.uri : '',
-          uri: typeof ph.googleMapsUri === 'string' ? ph.googleMapsUri : '',
-        };
+  function googleInfo(b) {
+    if (!GOOGLE_ON) return Promise.resolve(null);
+    if (googleInfoById.has(b.id)) return googleInfoById.get(b.id);
+    const promise = BACKEND.fn('google-place', { action: 'info', beach: { id: b.id, name: b.name || '', lat: b.lat, lon: b.lon } })
+      .then((r) => {
+        const info = r && r.place && typeof r.place.id === 'string' ? r.place : null;
+        if (info) googleInfoCache.set(b.id, info);
+        return info;
+      })
+      .catch((err) => {
+        googleInfoById.delete(b.id);
+        console.warn('Google data unavailable:', err && err.message);
+        return null;
       });
-    return { placeId, photos, at: Date.now() };
+    googleInfoById.set(b.id, promise);
+    return promise;
   }
 
   async function fetchGooglePhotos(b) {
-    if (!GOOGLE_KEY) return [];
-    let entry = googleCacheGet(b.id);
-    if (!entry) {
-      entry = await googleLookup(b);
-      googleCachePut(b.id, entry);
-    }
-    if (!entry.placeId || !entry.photos.length) return [];
-    const allowed = googleBudgetTake(Math.min(entry.photos.length, GOOGLE_PHOTO_LIMIT));
-    if (allowed <= 0) { console.info('Google photo budget for today is used up; showing free sources only.'); return []; }
-    const placeLink = 'https://www.google.com/maps/place/?q=place_id:' + encodeURIComponent(entry.placeId);
-    return entry.photos.slice(0, allowed).map((ph) => ({
-      thumb: PLACES + '/' + ph.name + '/media?key=' + encodeURIComponent(GOOGLE_KEY) + '&maxWidthPx=400&maxHeightPx=400',
-      page: ph.uri || placeLink,
+    const info = await googleInfo(b);
+    if (!info || !Array.isArray(info.photos) || !info.photos.length) return [];
+    const picks = info.photos.slice(0, GOOGLE_PHOTO_LIMIT);
+    const r = await BACKEND.fn('google-place', { action: 'photos', names: picks.map((ph) => ph.name) });
+    const uris = new Map(((r && r.photos) || [])
+      .filter((ph) => ph && typeof ph.uri === 'string' && /^https:\/\//.test(ph.uri))
+      .map((ph) => [ph.name, ph.uri]));
+    const placeLink = info.mapsUri || ('https://www.google.com/maps/place/?q=place_id:' + encodeURIComponent(info.id));
+    return picks.filter((ph) => uris.has(ph.name)).map((ph) => ({
+      thumb: uris.get(ph.name),
+      page: ph.mapsUri || placeLink,
       title: 'Google Maps photo',
-      artist: ph.author, authorUri: ph.authorUri || '', license: '', kind: 'google',
+      artist: ph.author || '',
+      authorUri: ph.authorUri || '',
+      license: '',
+      kind: 'google',
     }));
   }
 
@@ -982,7 +1174,7 @@
       out.push(ph);
       if (out.length >= PHOTO_MAX) break;
     }
-    if (GOOGLE_KEY && !out.some(looksLikeBeach)) {
+    if (GOOGLE_ON && !out.some(looksLikeBeach)) {
       const google = await fetchGooglePhotos(b).catch((err) => { console.warn('Google photos failed:', err && err.message); return []; });
       if (google.length) {
         const merged = google.concat(out.filter((ph) => !google.some((g) => g.thumb === ph.thumb)));
@@ -1001,28 +1193,28 @@
   }
 
   const SOURCE_NAMES = { osm: 'OpenStreetMap', wikipedia: 'Wikipedia', commons: 'Wikimedia Commons', flickr: 'Flickr', google: 'Google Maps' };
-  // Google requires its logo next to Places content shown away from a Google map.
-  const GOOGLE_LOGO_HTML = '<span class="google-badge"><img class="google-logo" src="assets/google_white.png" alt="Powered by Google" width="59" height="20"></span>';
 
-  async function showPhotos(b, li) {
-    let box = li.querySelector('.result-photos');
-    if (!box) {
-      box = document.createElement('div');
-      box.className = 'result-photos';
-      li.appendChild(box);
-    }
-    box.textContent = 'Loading photos…';
+  async function showPhotos(b, detail) {
+    const gallery = detail.querySelector('.gallery');
+    const note = detail.querySelector('.gallery-note');
+    if (!gallery || !note) return;
+    const alive = () => state.selectedId === b.id && detail.isConnected;
     let photos;
     try {
       photos = await fetchPhotos(b);
     } catch (err) {
-      if (state.selectedId === b.id && li.isConnected) box.textContent = 'Photos couldn’t be loaded right now.';
+      if (!alive()) return;
+      gallery.hidden = true;
+      note.textContent = 'Photos couldn’t be loaded right now.';
+      note.hidden = false;
       return;
     }
-    if (state.selectedId !== b.id || !li.isConnected) return;
-    box.textContent = '';
+    if (!alive()) return;
+    gallery.replaceChildren();
     if (photos.length === 0) {
-      box.textContent = 'No photos found near this beach yet.';
+      gallery.hidden = true;
+      note.textContent = 'No photos of this beach yet.';
+      note.hidden = false;
       return;
     }
     for (const ph of photos) {
@@ -1045,18 +1237,15 @@
         by.textContent = ph.artist;
         a.appendChild(by);
       }
-      box.appendChild(a);
+      gallery.appendChild(a);
     }
     const sources = [];
     for (const ph of photos) { const n = SOURCE_NAMES[ph.kind]; if (n && !sources.includes(n)) sources.push(n); }
-    const credit = document.createElement('span');
-    credit.className = 'photo-credit';
-    credit.textContent = sources.join(', ') + ' · within 1 km';
-    if (photos.some((ph) => ph.kind === 'google')) credit.insertAdjacentHTML('beforeend', ' ' + GOOGLE_LOGO_HTML);
-    box.appendChild(credit);
-
-    const m = markersById.get(b.id);
-    if (m) m.setPopupContent(popupHtml(b, photos[0]));
+    note.textContent = sources.join(', ') + ' · within 1 km';
+    if (photos.some((ph) => ph.kind === 'google')) note.insertAdjacentHTML('beforeend', GOOGLE_ATTR_HTML);
+    note.hidden = false;
+    popupPhotoById.set(b.id, photos[0]);
+    refreshPopup(b);
   }
 
   /* ---------- Location & geocoding ---------- */
@@ -1122,7 +1311,10 @@
     searchPlace(els.input.value);
   });
 
-  els.radius.addEventListener('change', () => setRadius(parseInt(els.radius.value, 10)));
+  els.radiusGroup.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t && t.name === 'radius' && t.checked) setRadius(parseInt(t.value, 10));
+  });
 
   els.tryRow.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-place]');
@@ -1132,16 +1324,10 @@
   });
 
   els.results.addEventListener('click', (e) => {
-    if (e.target.closest('a')) return;
-    const li = e.target.closest('.result');
-    if (li) select(li.dataset.id, 'list');
-  });
-
-  els.results.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    if (!e.target.classList || !e.target.classList.contains('result')) return;
-    e.preventDefault();
-    select(e.target.dataset.id, 'list');
+    const star = e.target.closest('.rate-stars button[data-stars]');
+    if (star) { submitRating(star.closest('.result'), Number(star.dataset.stars)); return; }
+    const head = e.target.closest('.result-head');
+    if (head) select(head.closest('.result').dataset.id, 'list');
   });
 
   // A click that merely dismisses a popup should not drop a new pin.
@@ -1156,20 +1342,21 @@
     setCenter(e.latlng.lat, e.latlng.lng, null);
   });
 
-  const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
-  if (darkMq.addEventListener) {
-    darkMq.addEventListener('change', () => { if (radiusCircle) radiusCircle.setStyle({ color: accentColor() }); });
-  }
+  const onThemeChange = () => {
+    if (vectorBase && vectorBase.getMaplibreMap()) vectorBase.getMaplibreMap().setStyle(isDark() ? STYLES.dark : STYLES.light);
+    if (radiusCircle) radiusCircle.setStyle({ color: accentColor() });
+  };
+  if (darkMq.addEventListener) darkMq.addEventListener('change', onThemeChange);
 
   /* ---------- Boot ---------- */
 
   function init() {
-    for (const k of OLD_CACHE_KEYS) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
+    for (const k of OLD_STORAGE_KEYS) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
     const stored = loadStored();
     if (stored && typeof stored.lat === 'number' && typeof stored.lon === 'number' && isFinite(stored.lat) && isFinite(stored.lon)) {
       if (RADII_KM.includes(stored.radius)) {
         state.radiusKm = stored.radius;
-        els.radius.value = String(stored.radius);
+        setRadiusControl(stored.radius);
       }
       let label = stored.name || null;
       if (label === 'you') label = 'your last location';
